@@ -1,0 +1,26 @@
+# NOTE: The setup.sh script generates this file automatically with the
+#       correct user. This template is for manual installs only.
+#       Replace YOUR_USER with your actual Linux username.
+
+[Unit]
+Description=NDI Controller (FastAPI + React)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/opt/ndi-controller/backend/ndi-controller-api
+Environment="PATH=/opt/ndi-controller/backend/ndi-controller-api/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+ExecStart=/opt/ndi-controller/backend/ndi-controller-api/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ndi-controller/backend/ndi-controller-api/data
+
+[Install]
+WantedBy=multi-user.target
