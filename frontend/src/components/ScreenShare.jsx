@@ -1,19 +1,9 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
 import { api } from '../api.js';
 
-/**
- * ScreenShare — captures the user's screen via getDisplayMedia, draws frames
- * to an off-screen canvas, encodes as JPEG, and sends over WebSocket to
- * /ws/screen-share where the backend pipes it into NDI.
- *
- * Uses requestAnimationFrame with a frame-time gate instead of setInterval
- * to avoid overlapping toBlob encode calls that cause frame pile-up.
- * Each frame encode+send must complete before the next one starts.
- */
-
 const TARGET_FPS = 30;
 const JPEG_QUALITY = 0.75;
-const FRAME_INTERVAL = 1000 / TARGET_FPS; // ms between frames
+const FRAME_INTERVAL = 1000 / TARGET_FPS;
 
 const isSecureContext =
     window.isSecureContext ||
@@ -26,19 +16,18 @@ export default function ScreenShare() {
     const [error, setError] = useState(null);
     const streamRef = useRef(null);
     const wsRef = useRef(null);
-    const rafRef = useRef(null);
+    const timerRef = useRef(null);
     const canvasRef = useRef(null);
     const videoRef = useRef(null);
     const cleaningUp = useRef(false);
 
-    // Cleanup helper — idempotent, safe to call multiple times
     const cleanup = useCallback(() => {
         if (cleaningUp.current) return;
         cleaningUp.current = true;
 
-        if (rafRef.current) {
-            cancelAnimationFrame(rafRef.current);
-            rafRef.current = null;
+        if (timerRef.current) {
+            clearTimeout(timerRef.current);
+            timerRef.current = null;
         }
         if (wsRef.current) {
             try { wsRef.current.close(); } catch {}
@@ -57,7 +46,6 @@ export default function ScreenShare() {
         cleaningUp.current = false;
     }, []);
 
-    // Stop sharing — tell backend, then clean up locally
     const stopSharing = useCallback(async () => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             try {
@@ -68,7 +56,6 @@ export default function ScreenShare() {
         try { await api.stop(); } catch {}
     }, [cleanup]);
 
-    // Cleanup on unmount
     useEffect(() => {
         return () => cleanup();
     }, [cleanup]);
@@ -76,45 +63,38 @@ export default function ScreenShare() {
     const startSharing = useCallback(async () => {
         setError(null);
         try {
-            // 1. Request screen capture from browser
             const stream = await navigator.mediaDevices.getDisplayMedia({
                 video: { frameRate: { ideal: TARGET_FPS } },
                 audio: false,
             });
             streamRef.current = stream;
 
-            // Detect when user clicks the browser's native "Stop sharing" button
             stream.getVideoTracks()[0].onended = () => {
                 cleanup();
                 api.stop().catch(() => {});
             };
 
-            // 2. Set up hidden video element to receive the stream
             const video = document.createElement('video');
             video.srcObject = stream;
             video.muted = true;
             await video.play();
             videoRef.current = video;
 
-            // Wait for video dimensions to be available
             await new Promise((resolve) => {
                 const check = () => {
                     if (video.videoWidth > 0) resolve();
-                    else requestAnimationFrame(check);
+                    else setTimeout(check, 50);
                 };
                 check();
             });
 
-            // 3. Set up canvas for frame extraction
             const canvas = document.createElement('canvas');
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             canvasRef.current = canvas;
 
-            // 4. Tell backend to enter browser mode
             await api.play({ mode: 'browser' });
 
-            // 5. Open WebSocket for frame transport
             const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const ws = new WebSocket(`${proto}//${window.location.host}/ws/screen-share`);
             wsRef.current = ws;
@@ -123,24 +103,19 @@ export default function ScreenShare() {
                 setSharing(true);
 
                 const ctx = canvas.getContext('2d');
-                let lastFrameTime = 0;
-                let encoding = false; // gate: prevents overlapping toBlob calls
+                let encoding = false;
 
-                const captureLoop = (timestamp) => {
+                const captureFrame = () => {
                     if (!wsRef.current || ws.readyState !== WebSocket.OPEN) return;
 
-                    rafRef.current = requestAnimationFrame(captureLoop);
+                    // Schedule next frame — setTimeout works in background tabs
+                    // (throttled to 1/sec, but never stops like RAF does)
+                    timerRef.current = setTimeout(captureFrame, FRAME_INTERVAL);
 
-                    // Throttle to TARGET_FPS
-                    if (timestamp - lastFrameTime < FRAME_INTERVAL) return;
-
-                    // If the previous toBlob hasn't finished yet, skip this
-                    // frame rather than piling up encode jobs
                     if (encoding) return;
+                    if (ws.bufferedAmount > 0) return;
 
-                    lastFrameTime = timestamp;
                     encoding = true;
-
                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                     canvas.toBlob(
                         (blob) => {
@@ -154,7 +129,7 @@ export default function ScreenShare() {
                     );
                 };
 
-                rafRef.current = requestAnimationFrame(captureLoop);
+                timerRef.current = setTimeout(captureFrame, 0);
             };
 
             ws.onclose = () => {
@@ -168,7 +143,7 @@ export default function ScreenShare() {
             };
         } catch (e) {
             if (e.name === 'NotAllowedError') {
-                return; // User cancelled the screen picker
+                return;
             }
             console.error('[screen-share] start failed:', e);
             setError(e.message);

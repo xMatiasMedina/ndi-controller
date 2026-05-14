@@ -106,24 +106,26 @@ class BrowserSource(IStreamSource):
         if not self._opened:
             return
 
-        # Decode JPEG -> BGR numpy array
-        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            return
+        try:
+            arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                return
 
-        if frame.shape[0] != self._height or frame.shape[1] != self._width:
-            frame = cv2.resize(
-                frame,
-                (self._width, self._height),
-                interpolation=cv2.INTER_AREA,
-            )
+            if frame.shape[0] != self._height or frame.shape[1] != self._width:
+                frame = cv2.resize(
+                    frame,
+                    (self._width, self._height),
+                    interpolation=cv2.INTER_AREA,
+                )
 
-        bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+            bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
 
-        with self._frame_lock:
-            self._latest_frame = bgra
-        self._frame_ready.set()
+            with self._frame_lock:
+                self._latest_frame = bgra
+            self._frame_ready.set()
+        except Exception as e:
+            print(f"[browser_source] push_frame error: {e}")
 
     def iter_video(self) -> Iterator[Tuple[np.ndarray, float]]:
         """Yield (BGRA frame, presentation_time) as frames arrive from the browser."""

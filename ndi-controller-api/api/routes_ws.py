@@ -119,7 +119,10 @@ async def screen_share_socket(websocket: WebSocket) -> None:
 
             if "bytes" in message and message["bytes"]:
                 # Binary = JPEG frame
-                _player.push_browser_frame(message["bytes"])
+                try:
+                    _player.push_browser_frame(message["bytes"])
+                except Exception as e:
+                    print(f"[ws/screen-share] frame {frame_count} error: {e}")
                 frame_count += 1
 
             elif "text" in message and message["text"]:
@@ -137,10 +140,10 @@ async def screen_share_socket(websocket: WebSocket) -> None:
                 except json.JSONDecodeError:
                     pass
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError, Exception) as e:
         print(
             f"[ws/screen-share] browser disconnected after {frame_count} frames"
+            f" ({type(e).__name__}: {e})"
         )
-        # Auto-stop playback when the browser drops the connection
         if _player.is_browser_active:
             _player.stop()
