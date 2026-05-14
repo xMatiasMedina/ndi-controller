@@ -42,12 +42,22 @@ def set_player_ref(player: PlayerService) -> None:
 @router.websocket("/ws/state")
 async def state_socket(websocket: WebSocket) -> None:
     await websocket.accept()
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
 
     async def handler(event: str, payload: Any) -> None:
-        await queue.put({"event": event, "payload": payload})
+        try:
+            queue.put_nowait({"event": event, "payload": payload})
+        except asyncio.QueueFull:
+            # Drop oldest to make room — keeps the client from falling behind
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait({"event": event, "payload": payload})
+            except asyncio.QueueFull:
+                pass
 
-    # Subscribe to the relevant events
     events_to_forward = [
         Events.PLAYER_STATE_CHANGED,
         Events.POSITION_CHANGED,
@@ -62,7 +72,7 @@ async def state_socket(websocket: WebSocket) -> None:
         while True:
             msg = await queue.get()
             await websocket.send_text(json.dumps(msg, default=str))
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, Exception):
         pass
     finally:
         for ev in events_to_forward:

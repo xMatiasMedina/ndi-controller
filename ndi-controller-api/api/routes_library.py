@@ -13,11 +13,12 @@ from services.library_service import LibraryService
 
 router = APIRouter(prefix="/api/library", tags=["library"])
 
-# Allowed video extensions
 ALLOWED_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
     ".m4v", ".mpg", ".mpeg", ".ts", ".mts",
 }
+
+MAX_UPLOAD_SIZE = 8 * 1024 * 1024 * 1024  # 8 GB
 
 
 def get_library() -> LibraryService:
@@ -75,9 +76,25 @@ async def upload_video(
         counter += 1
 
     try:
+        written = 0
         with dest.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_SIZE:
+                    f.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Max size: {MAX_UPLOAD_SIZE // (1024*1024*1024)} GB",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        raise
     except Exception as e:
+        dest.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
     finally:
         await file.close()

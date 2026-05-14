@@ -100,23 +100,30 @@ class ScreenSource(IStreamSource):
         period = 1.0 / self._target_fps
         t0 = time.perf_counter()
         frame_index = 0
+        consecutive_errors = 0
 
         while self._opened:
-            # Grab the screen region
-            raw = self._sct.grab(self._monitor)
+            try:
+                raw = self._sct.grab(self._monitor)
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors > 10:
+                    print(f"[screen_source] too many grab errors, stopping: {e}")
+                    return
+                print(f"[screen_source] grab error (attempt {consecutive_errors}): {e}")
+                time.sleep(0.1)
+                continue
 
-            # mss returns BGRA as a ctypes byte array; convert to numpy
             frame = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(
                 raw.height, raw.width, 3
             )
-            # mss .rgb is actually RGB despite the name — convert to BGRA
             bgra = cv2.cvtColor(frame, cv2.COLOR_RGB2BGRA)
 
             presentation_time = frame_index * period
             yield bgra, presentation_time
             frame_index += 1
 
-            # Pace to target fps
             target = t0 + (frame_index * period)
             dt = target - time.perf_counter()
             if dt > 0:

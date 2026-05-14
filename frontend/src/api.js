@@ -86,6 +86,13 @@ export const api = {
     obsScenes: () => request('/api/obs/scenes'),
     obsSetScene: (sceneName) =>
         request(`/api/obs/scene/${encodeURIComponent(sceneName)}`, { method: 'POST' }),
+    obsSceneSources: (sceneName) =>
+        request(`/api/obs/scene/${encodeURIComponent(sceneName)}/sources`),
+    obsSetSourceEnabled: (sceneName, itemId, enabled) =>
+        request(`/api/obs/scene/${encodeURIComponent(sceneName)}/source/${itemId}`, {
+            method: 'POST',
+            body: JSON.stringify({ enabled }),
+        }),
 
     // Settings
     getSettings: () => request('/api/settings'),

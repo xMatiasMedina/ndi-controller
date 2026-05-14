@@ -46,6 +46,7 @@ from fractions import Fraction
 from typing import Callable, Optional
 
 import numpy as np
+import traceback
 
 try:
     from cyndilib.sender import Sender
@@ -103,9 +104,10 @@ class NDIStreamer:
         self._on_position = on_position
         self._on_finished = on_finished
 
-        # Atomic-enough flags (CPython single-write bool/int are GIL-safe)
-        self._running = False
+        self._stop_event = threading.Event()
         self._paused = False
+        self._pause_started: float = 0.0
+        self._total_paused: float = 0.0
         self._muted = False
         self._video_offset = 0.0
         self._audio_offset = 0.0
@@ -113,7 +115,7 @@ class NDIStreamer:
         self._source: Optional[IStreamSource] = None
         self._threads: list[threading.Thread] = []
         self._t0: float = 0.0
-        self._is_live: bool = False  # True for live sources (screen/browser)
+        self._is_live: bool = False
 
         # NDI senders — created on start, destroyed on stop
         self._v_sender: Optional[Sender] = None
@@ -126,20 +128,18 @@ class NDIStreamer:
 
     # ----- Public control -----
     def start(self, source: IStreamSource) -> None:
-        if self._running:
+        if not self._stop_event.is_set() and self._threads:
             self.stop()
 
         self._source = source
         self._source.open()
 
-        # Live sources (duration == 0) get different timing in the video loop:
-        # no presentation-time pacing — just fire frames as they arrive and
-        # let NDI's clock_video handle the cadence.
         self._is_live = source.duration_seconds == 0.0
 
         self._init_ndi()
-        self._running = True
+        self._stop_event.clear()
         self._paused = False
+        self._total_paused = 0.0
         self._t0 = time.perf_counter()
 
         tv = threading.Thread(target=self._video_loop, daemon=True, name="ndi-video")
@@ -148,21 +148,28 @@ class NDIStreamer:
         self._threads = [tv, ta]
 
     def stop(self) -> None:
-        self._running = False
+        self._stop_event.set()
         for t in self._threads:
-            t.join(timeout=2)
+            t.join(timeout=3)
+            if t.is_alive():
+                print(f"[ndi] WARNING: thread {t.name} did not exit in time")
         self._threads = []
 
         if self._source is not None:
-            self._source.close()
+            try:
+                self._source.close()
+            except Exception as e:
+                print(f"[ndi] source close error: {e}")
             self._source = None
 
         self._shutdown_ndi()
 
     def pause(self, paused: bool) -> None:
+        if paused and not self._paused:
+            self._pause_started = time.perf_counter()
+        elif not paused and self._paused:
+            self._total_paused += time.perf_counter() - self._pause_started
         self._paused = paused
-        if not paused:
-            self._t0 = time.perf_counter()
 
     def set_muted(self, muted: bool) -> None:
         self._muted = muted
@@ -176,10 +183,10 @@ class NDIStreamer:
     def seek(self, position_seconds: float) -> None:
         if self._source is not None:
             self._source.seek(position_seconds)
-            self._t0 = time.perf_counter() - position_seconds
+            self._t0 = time.perf_counter() - position_seconds - self._total_paused
 
     @property
-    def is_running(self) -> bool: return self._running
+    def is_running(self) -> bool: return not self._stop_event.is_set()
 
     @property
     def is_paused(self) -> bool: return self._paused
@@ -270,63 +277,69 @@ class NDIStreamer:
         """Writes only to the 'OBS Video' sender."""
         assert self._source is not None
         last_position = 0.0
+        finished_naturally = False
 
-        for frame_bgra, presentation_time in self._source.iter_video():
-            if not self._running:
-                return
+        try:
+            for frame_bgra, presentation_time in self._source.iter_video():
+                if self._stop_event.is_set():
+                    return
 
-            while self._paused and self._running:
-                time.sleep(0.05)
+                while self._paused and not self._stop_event.is_set():
+                    time.sleep(0.05)
 
-            # For file-based sources, pace delivery using presentation time so
-            # the video plays back at the correct speed. For live sources
-            # (screen share, browser capture), skip pacing entirely — the
-            # source yields frames in real-time and NDI's clock_video handles
-            # the output cadence. Pacing a live source with a stale _t0 causes
-            # frames to blast out without any NDI clock sync, which produces
-            # stuttery / looping output.
-            if not self._is_live:
-                target = self._t0 + self._video_offset + presentation_time
-                dt = target - time.perf_counter()
-                if dt > 0:
-                    time.sleep(dt)
+                if not self._is_live:
+                    target = (
+                        self._t0
+                        + self._total_paused
+                        + self._video_offset
+                        + presentation_time
+                    )
+                    dt = target - time.perf_counter()
+                    if dt > 0:
+                        time.sleep(dt)
 
-            try:
                 self._v_sender.write_video(self._flatten_bgra(frame_bgra))
-            except Exception as e:
-                print(f"[ndi] video send error: {e}")
-                return
 
-            last_position = presentation_time
-            if self._on_position is not None:
-                self._on_position(last_position)
+                last_position = presentation_time
+                if self._on_position is not None:
+                    self._on_position(last_position)
 
-        if self._on_finished is not None:
-            self._on_finished()
+            finished_naturally = True
+        except Exception as e:
+            if not self._stop_event.is_set():
+                print(f"[ndi] video loop error: {e}")
+                traceback.print_exc()
+        finally:
+            if finished_naturally and self._on_finished is not None:
+                self._on_finished()
+            elif not finished_naturally and not self._stop_event.is_set():
+                if self._on_finished is not None:
+                    self._on_finished()
 
     def _audio_loop(self) -> None:
         """
         Writes to the 'Reaper Audio' sender. Every 20 ms calls
         write_video_and_audio() with a black 16x16 frame and the next audio
-        chunk — one atomic operation. Real audio samples when available,
-        silence otherwise, so Reaper's NDI Input stays locked on.
+        chunk — one atomic operation.
         """
         assert self._source is not None
         chunk = AUDIO_CHUNK_SAMPLES
 
-        # Pre-flatten the black 16x16 BGRA frame (16*16*4 = 1024 bytes)
         black_keep = np.zeros(
             (AUDIO_SENDER_VIDEO_H, AUDIO_SENDER_VIDEO_W, 4), dtype=np.uint8
         ).reshape(-1)
 
-        # Planar silence buffer — shape (channels, chunk)
         silence = np.ascontiguousarray(
             np.zeros((config.AUDIO_CHANNELS, chunk), dtype=np.float32)
         )
 
-        if self._source.has_audio:
-            samples = self._source.get_audio()  # shape (N, channels)
-        else:
+        try:
+            if self._source.has_audio:
+                samples = self._source.get_audio()
+            else:
+                samples = np.zeros((0, config.AUDIO_CHANNELS), dtype=np.float32)
+        except Exception as e:
+            print(f"[ndi] failed to get audio: {e}")
             samples = np.zeros((0, config.AUDIO_CHANNELS), dtype=np.float32)
 
         total = samples.shape[0]
@@ -336,43 +349,44 @@ class NDIStreamer:
             (chunk, config.AUDIO_CHANNELS), dtype=np.float32
         )
 
-        while self._running:
-            while self._paused and self._running:
-                time.sleep(0.05)
-            if not self._running:
-                return
+        try:
+            while not self._stop_event.is_set():
+                while self._paused and not self._stop_event.is_set():
+                    time.sleep(0.05)
+                if self._stop_event.is_set():
+                    return
 
-            if pos < total:
-                end = min(pos + chunk, total)
-                block = samples[pos:end]
-                if block.shape[0] < chunk:
-                    pad_buffer[:] = 0
-                    pad_buffer[: block.shape[0]] = block
-                    block = pad_buffer
-                if self._muted:
-                    block = np.zeros_like(block)
-                planar = np.ascontiguousarray(block.T.astype(np.float32))
-                pos = end
-            else:
-                planar = silence
+                if pos < total:
+                    end = min(pos + chunk, total)
+                    block = samples[pos:end]
+                    if block.shape[0] < chunk:
+                        pad_buffer[:] = 0
+                        pad_buffer[: block.shape[0]] = block
+                        block = pad_buffer
+                    if self._muted:
+                        block = np.zeros_like(block)
+                    planar = np.ascontiguousarray(block.T.astype(np.float32))
+                    pos = end
+                else:
+                    planar = silence
 
-            target = (
-                self._t0
-                + self._audio_offset
-                + i * (chunk / config.AUDIO_SAMPLE_RATE)
-            )
-            dt = target - time.perf_counter()
-            if dt > 0:
-                time.sleep(dt)
+                target = (
+                    self._t0
+                    + self._total_paused
+                    + self._audio_offset
+                    + i * (chunk / config.AUDIO_SAMPLE_RATE)
+                )
+                dt = target - time.perf_counter()
+                if dt > 0:
+                    time.sleep(dt)
 
-            try:
-                # Atomic paired write — canonical cyndilib pattern
                 self._a_sender.write_video_and_audio(
                     video_data=black_keep,
                     audio_data=planar,
                 )
-            except Exception as e:
-                print(f"[ndi] audio-sender combined send error: {e}")
-                return
 
-            i += 1
+                i += 1
+        except Exception as e:
+            if not self._stop_event.is_set():
+                print(f"[ndi] audio loop error: {e}")
+                traceback.print_exc()

@@ -15,6 +15,12 @@ const TARGET_FPS = 30;
 const JPEG_QUALITY = 0.75;
 const FRAME_INTERVAL = 1000 / TARGET_FPS; // ms between frames
 
+const isSecureContext =
+    window.isSecureContext ||
+    location.protocol === 'https:' ||
+    location.hostname === 'localhost' ||
+    location.hostname === '127.0.0.1';
+
 export default function ScreenShare() {
     const [sharing, setSharing] = useState(false);
     const [error, setError] = useState(null);
@@ -169,6 +175,19 @@ export default function ScreenShare() {
             cleanup();
         }
     }, [cleanup]);
+
+    if (!isSecureContext) {
+        return (
+            <div className="screen-share-section">
+                <button className="screen-share-btn" disabled>
+                    <span className="screen-share-icon">⊞</span> Share Screen
+                </button>
+                <div style={{ fontSize: 11, color: 'var(--warning)', marginTop: 6 }}>
+                    Screen sharing requires HTTPS. Access via https:// or localhost.
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="screen-share-section">

@@ -16,14 +16,19 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [activeTab, setActiveTab] = useState('offsets'); // 'offsets' | 'obs'
 
-  // Keep a local list of videos for "now playing" name lookup
+  // Keep a local list of videos for "now playing" name lookup.
+  // Poll only when WebSocket is disconnected; otherwise a single fetch suffices.
   useEffect(() => {
     api.listVideos().then(setVideos).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (connected) return;
     const id = setInterval(() => {
       api.listVideos().then(setVideos).catch(() => {});
     }, 5000);
     return () => clearInterval(id);
-  }, []);
+  }, [connected]);
 
   // Sync loop checkbox with backend state when WS pushes updates
   useEffect(() => {

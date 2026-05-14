@@ -144,6 +144,27 @@ async def obs_set_scene(scene_name: str):
     return {"scene": scene_name}
 
 
+@app.get("/api/obs/scene/{scene_name}/sources")
+async def obs_scene_sources(scene_name: str):
+    items = await container.obs.list_scene_items(scene_name)
+    return {"sources": items}
+
+
+from pydantic import BaseModel
+
+
+class SetSourceEnabledBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/obs/scene/{scene_name}/source/{item_id}")
+async def obs_set_source_enabled(scene_name: str, item_id: int, body: SetSourceEnabledBody):
+    ok = await container.obs.set_scene_item_enabled(scene_name, item_id, body.enabled)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Failed to toggle source")
+    return {"sceneItemId": item_id, "enabled": body.enabled}
+
+
 # Serve the built React frontend if present (production mode)
 frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
 if frontend_dist.exists():

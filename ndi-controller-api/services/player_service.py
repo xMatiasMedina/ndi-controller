@@ -10,6 +10,13 @@ This is the only place that knows about ALL of:
 Everything else (routes, frontend) goes through this service. The routes are
 thin HTTP adapters; the streamer doesn't know what a playlist is; the
 reaper client doesn't know what's playing. Single Responsibility per layer.
+
+Threading model:
+  _state_lock guards all PlayerState reads and writes.
+  _lifecycle_lock serialises streamer start/stop so that concurrent calls
+  (user stop + auto-advance, rapid next-track clicks) don't interleave.
+  Lock order: always acquire _lifecycle_lock BEFORE _state_lock to avoid
+  deadlocks.
 """
 from __future__ import annotations
 
@@ -47,14 +54,16 @@ class PlayerService:
         self._reaper = reaper
 
         self._state = PlayerState()
-        self._lock = threading.Lock()  # guards state mutations
+        self._state_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._streamer: Optional[NDIStreamer] = None
-        self._browser_source = None  # holds BrowserSource when in BROWSER mode
+        self._browser_source = None
+        self._generation = 0
 
     # ---------------------------------------------------------------- public
     def get_state(self) -> PlayerState:
-        with self._lock:
+        with self._state_lock:
             return self._state.model_copy(deep=True)
 
     def play(
@@ -66,83 +75,100 @@ class PlayerService:
         loop: bool = False,
     ) -> PlayerState:
         """Start playback. Stops any current playback first."""
-        self.stop()
+        with self._lifecycle_lock:
+            self._stop_streamer()
 
-        with self._lock:
-            self._state.mode = mode
-            self._state.loop = loop
+            with self._state_lock:
+                self._state.mode = mode
+                self._state.loop = loop
 
-            if mode == PlaybackMode.SINGLE:
-                if not video_id:
-                    raise ValueError("SINGLE mode requires video_id")
-                self._state.current_video_id = video_id
-                self._state.current_playlist_id = None
-                self._state.playlist_cursor = 0
+                if mode == PlaybackMode.SINGLE:
+                    if not video_id:
+                        raise ValueError("SINGLE mode requires video_id")
+                    self._state.current_video_id = video_id
+                    self._state.current_playlist_id = None
+                    self._state.playlist_cursor = 0
 
-            elif mode == PlaybackMode.PLAYLIST:
-                if not playlist_id:
-                    raise ValueError("PLAYLIST mode requires playlist_id")
-                playlist = self._playlists.get_playlist(playlist_id)
-                if not playlist or not playlist.video_ids:
-                    raise ValueError("Playlist is empty or not found")
-                self._state.current_playlist_id = playlist_id
-                self._state.playlist_cursor = 0
-                self._state.current_video_id = playlist.video_ids[0]
+                elif mode == PlaybackMode.PLAYLIST:
+                    if not playlist_id:
+                        raise ValueError("PLAYLIST mode requires playlist_id")
+                    playlist = self._playlists.get_playlist(playlist_id)
+                    if not playlist or not playlist.video_ids:
+                        raise ValueError("Playlist is empty or not found")
+                    self._state.current_playlist_id = playlist_id
+                    self._state.playlist_cursor = 0
+                    self._state.current_video_id = playlist.video_ids[0]
 
-            elif mode == PlaybackMode.SCREEN:
-                self._state.monitor_index = monitor_index or 0
-                self._state.current_video_id = None
-                self._state.current_playlist_id = None
+                elif mode == PlaybackMode.SCREEN:
+                    self._state.monitor_index = monitor_index or 0
+                    self._state.current_video_id = None
+                    self._state.current_playlist_id = None
 
-            elif mode == PlaybackMode.BROWSER:
-                self._state.current_video_id = None
-                self._state.current_playlist_id = None
+                elif mode == PlaybackMode.BROWSER:
+                    self._state.current_video_id = None
+                    self._state.current_playlist_id = None
 
-        self._start_current_source()
+                snap_mode = self._state.mode
+                snap_video_id = self._state.current_video_id
+                snap_monitor = self._state.monitor_index
+                snap_v_off = self._state.video_offset_ms
+                snap_a_off = self._state.audio_offset_ms
+                snap_muted = self._state.muted
+
+            self._start_source(
+                snap_mode, snap_video_id, snap_monitor,
+                snap_v_off, snap_a_off, snap_muted,
+            )
         return self.get_state()
 
     def pause(self) -> PlayerState:
-        with self._lock:
-            if self._state.status == PlaybackStatus.PLAYING:
-                self._state.status = PlaybackStatus.PAUSED
-                if self._streamer:
-                    self._streamer.pause(True)
-                if self._settings.get().reaper.lockstep:
-                    self._reaper.pause()
+        with self._state_lock:
+            if self._state.status != PlaybackStatus.PLAYING:
+                return self._state.model_copy(deep=True)
+            self._state.status = PlaybackStatus.PAUSED
+            streamer = self._streamer
+        if streamer:
+            streamer.pause(True)
+        if self._settings.get().reaper.lockstep:
+            self._reaper.pause()
         self._publish_state_change()
         return self.get_state()
 
     def resume(self) -> PlayerState:
-        with self._lock:
-            if self._state.status == PlaybackStatus.PAUSED:
-                self._state.status = PlaybackStatus.PLAYING
-                if self._streamer:
-                    self._streamer.pause(False)
-                if self._settings.get().reaper.lockstep:
-                    self._reaper.play()
+        with self._state_lock:
+            if self._state.status != PlaybackStatus.PAUSED:
+                return self._state.model_copy(deep=True)
+            self._state.status = PlaybackStatus.PLAYING
+            streamer = self._streamer
+        if streamer:
+            streamer.pause(False)
+        if self._settings.get().reaper.lockstep:
+            self._reaper.play()
         self._publish_state_change()
         return self.get_state()
 
     def stop(self) -> PlayerState:
-        with self._lock:
-            self._state.status = PlaybackStatus.STOPPED
-            self._state.position_seconds = 0.0
-        if self._streamer:
-            self._streamer.stop()
-            self._streamer = None
-        self._browser_source = None  # release browser source
-        if self._settings.get().reaper.lockstep:
-            self._reaper.stop()
+        with self._lifecycle_lock:
+            self._stop_streamer()
+            with self._state_lock:
+                self._state.status = PlaybackStatus.STOPPED
+                self._state.position_seconds = 0.0
+            if self._settings.get().reaper.lockstep:
+                self._reaper.stop()
         self._publish_state_change()
         return self.get_state()
 
     def seek(self, position_seconds: float) -> PlayerState:
-        with self._lock:
+        with self._state_lock:
+            if self._state.status == PlaybackStatus.STOPPED:
+                return self._state.model_copy(deep=True)
             self._state.position_seconds = max(0.0, position_seconds)
-        if self._streamer:
-            self._streamer.seek(self._state.position_seconds)
+            pos = self._state.position_seconds
+            streamer = self._streamer
+        if streamer:
+            streamer.seek(pos)
         if self._settings.get().reaper.lockstep:
-            self._reaper.seek(self._state.position_seconds)
+            self._reaper.seek(pos)
         self._publish_state_change()
         return self.get_state()
 
@@ -157,77 +183,98 @@ class PlayerService:
         video_offset_ms: Optional[int] = None,
         audio_offset_ms: Optional[int] = None,
     ) -> PlayerState:
-        with self._lock:
+        with self._state_lock:
             if video_offset_ms is not None:
                 self._state.video_offset_ms = video_offset_ms
-                if self._streamer:
-                    self._streamer.set_video_offset_ms(video_offset_ms)
             if audio_offset_ms is not None:
                 self._state.audio_offset_ms = audio_offset_ms
-                if self._streamer:
-                    self._streamer.set_audio_offset_ms(audio_offset_ms)
+            streamer = self._streamer
+        if streamer:
+            if video_offset_ms is not None:
+                streamer.set_video_offset_ms(video_offset_ms)
+            if audio_offset_ms is not None:
+                streamer.set_audio_offset_ms(audio_offset_ms)
         self._publish_state_change()
         return self.get_state()
 
     def set_muted(self, muted: bool) -> PlayerState:
-        with self._lock:
+        with self._state_lock:
             self._state.muted = muted
-            if self._streamer:
-                self._streamer.set_muted(muted)
+            streamer = self._streamer
+        if streamer:
+            streamer.set_muted(muted)
         self._publish_state_change()
         return self.get_state()
 
     def push_browser_frame(self, jpeg_bytes: bytes) -> None:
-        """Push a JPEG frame from the browser WebSocket into the active BrowserSource."""
-        if self._browser_source is not None:
-            self._browser_source.push_frame(jpeg_bytes)
+        bs = self._browser_source
+        if bs is not None:
+            bs.push_frame(jpeg_bytes)
 
     @property
     def is_browser_active(self) -> bool:
-        """True when in BROWSER mode and source is ready for frames."""
-        return self._browser_source is not None and self._state.mode == PlaybackMode.BROWSER
+        return (
+            self._browser_source is not None
+            and self._state.mode == PlaybackMode.BROWSER
+        )
 
     def shutdown(self) -> None:
-        """Called on app shutdown."""
+        with self._lifecycle_lock:
+            self._stop_streamer()
+
+    # --------------------------------------------------------------- private
+    def _stop_streamer(self) -> None:
+        """Stop the current streamer and source. Caller must hold _lifecycle_lock."""
+        self._generation += 1
         if self._streamer:
             self._streamer.stop()
             self._streamer = None
         self._browser_source = None
 
-    # --------------------------------------------------------------- private
-    def _start_current_source(self) -> None:
-        """Build the IStreamSource for current state and hand it to the streamer."""
+    def _start_source(
+        self,
+        mode: PlaybackMode,
+        video_id: Optional[str],
+        monitor_index: int,
+        video_offset_ms: int,
+        audio_offset_ms: int,
+        muted: bool,
+    ) -> None:
+        """Build the IStreamSource and hand it to a new streamer.
+        Caller must hold _lifecycle_lock."""
         source: IStreamSource
+        gen = self._generation
 
-        if self._state.mode == PlaybackMode.SCREEN:
+        if mode == PlaybackMode.SCREEN:
             from streaming.screen_source import ScreenSource
-            source = ScreenSource(monitor_index=self._state.monitor_index)
+            source = ScreenSource(monitor_index=monitor_index)
 
-        elif self._state.mode == PlaybackMode.BROWSER:
+        elif mode == PlaybackMode.BROWSER:
             from streaming.browser_source import BrowserSource
             browser_src = BrowserSource()
             self._browser_source = browser_src
             source = browser_src
 
         else:
-            video = self._library.get_video(self._state.current_video_id)
+            video = self._library.get_video(video_id)
             if not video:
-                raise ValueError(f"Video not found: {self._state.current_video_id}")
+                raise ValueError(f"Video not found: {video_id}")
             source = FileSource(video.path)
 
         ndi_settings = self._settings.get().ndi
-        self._streamer = NDIStreamer(
+        streamer = NDIStreamer(
             video_source_name=ndi_settings.video_source_name,
             audio_source_name=ndi_settings.audio_source_name,
             on_position=self._on_position,
-            on_finished=self._on_finished,
+            on_finished=lambda: self._on_finished(gen),
         )
-        self._streamer.set_video_offset_ms(self._state.video_offset_ms)
-        self._streamer.set_audio_offset_ms(self._state.audio_offset_ms)
-        self._streamer.set_muted(self._state.muted)
-        self._streamer.start(source)
+        streamer.set_video_offset_ms(video_offset_ms)
+        streamer.set_audio_offset_ms(audio_offset_ms)
+        streamer.set_muted(muted)
+        streamer.start(source)
+        self._streamer = streamer
 
-        with self._lock:
+        with self._state_lock:
             self._state.status = PlaybackStatus.PLAYING
             self._state.position_seconds = 0.0
             self._state.duration_seconds = source.duration_seconds
@@ -239,67 +286,86 @@ class PlayerService:
         self._publish_state_change()
 
     def _advance_playlist(self, delta: int) -> PlayerState:
-        """Move ±1 in the playlist; respect loop; stop when off the end."""
-        with self._lock:
-            if self._state.mode != PlaybackMode.PLAYLIST:
-                return self._state.model_copy(deep=True)
+        """Move +/-1 in the playlist; respect loop; stop when off the end."""
+        with self._lifecycle_lock:
+            should_stop = False
+            with self._state_lock:
+                if self._state.status == PlaybackStatus.STOPPED:
+                    return self._state.model_copy(deep=True)
+                if self._state.mode != PlaybackMode.PLAYLIST:
+                    return self._state.model_copy(deep=True)
 
-            playlist = self._playlists.get_playlist(self._state.current_playlist_id)
-            if not playlist or not playlist.video_ids:
-                return self._state.model_copy(deep=True)
+                playlist = self._playlists.get_playlist(
+                    self._state.current_playlist_id
+                )
+                if not playlist or not playlist.video_ids:
+                    return self._state.model_copy(deep=True)
 
-            new_cursor = self._state.playlist_cursor + delta
-            n = len(playlist.video_ids)
+                new_cursor = self._state.playlist_cursor + delta
+                n = len(playlist.video_ids)
 
-            if 0 <= new_cursor < n:
-                self._state.playlist_cursor = new_cursor
-            elif self._state.loop:
-                self._state.playlist_cursor = new_cursor % n
-            else:
-                # off the end and not looping — stop
-                self._stop_internal_locked()
+                if 0 <= new_cursor < n:
+                    self._state.playlist_cursor = new_cursor
+                elif self._state.loop:
+                    self._state.playlist_cursor = new_cursor % n
+                else:
+                    self._state.status = PlaybackStatus.STOPPED
+                    self._state.position_seconds = 0.0
+                    should_stop = True
+
+                if not should_stop:
+                    self._state.current_video_id = playlist.video_ids[
+                        self._state.playlist_cursor
+                    ]
+                    snap_video_id = self._state.current_video_id
+                    snap_v_off = self._state.video_offset_ms
+                    snap_a_off = self._state.audio_offset_ms
+                    snap_muted = self._state.muted
+
+            if should_stop:
+                self._stop_streamer()
                 self._publish_state_change()
-                return self._state.model_copy(deep=True)
+                return self.get_state()
 
-            self._state.current_video_id = playlist.video_ids[
-                self._state.playlist_cursor
-            ]
-
-        # Restart with the new track outside the lock
-        if self._streamer:
-            self._streamer.stop()
-            self._streamer = None
-        self._start_current_source()
+            self._stop_streamer()
+            self._start_source(
+                PlaybackMode.PLAYLIST, snap_video_id, 0,
+                snap_v_off, snap_a_off, snap_muted,
+            )
         return self.get_state()
-
-    def _stop_internal_locked(self) -> None:
-        """Internal stop — caller must hold the lock."""
-        self._state.status = PlaybackStatus.STOPPED
-        self._state.position_seconds = 0.0
 
     # ----- callbacks from the streamer threads -----
     def _on_position(self, position: float) -> None:
-        with self._lock:
+        with self._state_lock:
             self._state.position_seconds = position
-        # Position updates are noisy — publish a lighter event
         event_bus.publish_sync(
             Events.POSITION_CHANGED,
             {"position_seconds": position},
         )
 
-    def _on_finished(self) -> None:
-        """Streamer ran out of frames. Either advance, loop, or stop."""
-        mode = self.get_state().mode
+    def _on_finished(self, generation: int) -> None:
+        """Streamer ran out of frames. Either advance, loop, or stop.
+        The generation check prevents stale callbacks from acting on a
+        player that has already moved on (user pressed stop/next)."""
+        if generation != self._generation:
+            return
+
+        with self._state_lock:
+            mode = self._state.mode
+            loop = self._state.loop
+            status = self._state.status
+
+        if status == PlaybackStatus.STOPPED:
+            return
+
         if mode == PlaybackMode.PLAYLIST:
-            # Schedule advance on the asyncio loop so it can call services
             self._schedule_async(self._advance_playlist_async(+1))
-        elif mode == PlaybackMode.SINGLE and self.get_state().loop:
+        elif mode == PlaybackMode.SINGLE and loop:
             self._schedule_async(self._restart_single_async())
         else:
             self._schedule_async(self._stop_async())
 
     def attach_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Called from main.py at startup so worker threads can schedule coroutines."""
         self._loop = loop
 
     def _schedule_async(self, coro) -> None:
@@ -311,7 +377,21 @@ class PlayerService:
         self._advance_playlist(delta)
 
     async def _restart_single_async(self) -> None:
-        self._start_current_source()
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._state.status == PlaybackStatus.STOPPED:
+                    return
+                snap_video_id = self._state.current_video_id
+                snap_v_off = self._state.video_offset_ms
+                snap_a_off = self._state.audio_offset_ms
+                snap_muted = self._state.muted
+                snap_mode = self._state.mode
+
+            self._stop_streamer()
+            self._start_source(
+                snap_mode, snap_video_id, 0,
+                snap_v_off, snap_a_off, snap_muted,
+            )
 
     async def _stop_async(self) -> None:
         self.stop()

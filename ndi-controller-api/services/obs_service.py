@@ -95,11 +95,10 @@ class ObsService(IObsClient):
             resp = await loop.run_in_executor(
                 None, self._client.get_scene_list
             )
-            # resp.scenes is a list of dicts with 'sceneName', 'sceneIndex'
             return [s["sceneName"] for s in resp.scenes]
         except Exception as e:
             print(f"[obs] list_scenes failed: {e}")
-            await self._handle_disconnect(e)
+            self._mark_disconnected(e)
             return []
 
     async def get_current_scene(self) -> Optional[str]:
@@ -113,7 +112,7 @@ class ObsService(IObsClient):
             return resp.scene_name
         except Exception as e:
             print(f"[obs] get_current_scene failed: {e}")
-            await self._handle_disconnect(e)
+            self._mark_disconnected(e)
             return None
 
     async def set_current_scene(self, name: str) -> bool:
@@ -129,19 +128,63 @@ class ObsService(IObsClient):
             return True
         except Exception as e:
             print(f"[obs] set_current_scene('{name}') failed: {e}")
-            await self._handle_disconnect(e)
+            self._mark_disconnected(e)
             return False
 
-    async def _handle_disconnect(self, error: Exception) -> None:
-        """Mark disconnected if the error looks like a broken connection."""
-        error_str = str(error).lower()
-        if any(
-            kw in error_str
-            for kw in ("closed", "broken", "refused", "reset", "timeout")
-        ):
-            self._connected = False
-            self._client = None
-            event_bus.publish_sync(
-                Events.OBS_STATUS_CHANGED,
-                {"connected": False, "error": str(error)},
+    async def list_scene_items(self, scene_name: str) -> List[dict]:
+        """Return sources (scene items) for a given scene.
+
+        Each item has: sceneItemId, sourceName, inputKind, sceneItemEnabled.
+        """
+        if not self._connected or self._client is None:
+            return []
+        loop = asyncio.get_running_loop()
+        try:
+            resp = await loop.run_in_executor(
+                None, self._client.get_scene_item_list, scene_name
             )
+            return [
+                {
+                    "sceneItemId": item["sceneItemId"],
+                    "sourceName": item.get("sourceName", ""),
+                    "inputKind": item.get("inputKind"),
+                    "sceneItemEnabled": item.get("sceneItemEnabled", True),
+                }
+                for item in resp.scene_items
+            ]
+        except Exception as e:
+            print(f"[obs] list_scene_items('{scene_name}') failed: {e}")
+            self._mark_disconnected(e)
+            return []
+
+    async def set_scene_item_enabled(
+        self, scene_name: str, item_id: int, enabled: bool
+    ) -> bool:
+        """Show/hide a source (scene item) within a scene."""
+        if not self._connected or self._client is None:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                self._client.set_scene_item_enabled,
+                scene_name,
+                item_id,
+                enabled,
+            )
+            print(f"[obs] set item {item_id} in '{scene_name}' enabled={enabled}")
+            return True
+        except Exception as e:
+            print(f"[obs] set_scene_item_enabled failed: {e}")
+            self._mark_disconnected(e)
+            return False
+
+    def _mark_disconnected(self, error: Exception) -> None:
+        """Mark as disconnected on any communication failure.
+        The next explicit connect() call will re-establish."""
+        self._connected = False
+        self._client = None
+        event_bus.publish_sync(
+            Events.OBS_STATUS_CHANGED,
+            {"connected": False, "error": str(error)},
+        )
