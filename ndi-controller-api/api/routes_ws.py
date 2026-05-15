@@ -7,6 +7,8 @@ WebSocket routes:
 
 2. /ws/screen-share — receives JPEG frames from the browser's getDisplayMedia
    capture and pushes them into the active BrowserSource via PlayerService.
+   On connect: switches OBS to the StreamScreen scene.
+   On disconnect: schedules a delayed revert to the previous scene.
    Binary messages = JPEG frame data. Text messages = JSON control commands.
 """
 from __future__ import annotations
@@ -19,23 +21,24 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from core.events import Events, event_bus
 from services.player_service import PlayerService
+from services.obs_service import ObsService
 
 router = APIRouter()
 
 
-# ----- Dependency placeholder (overridden by main.py) -----
-def get_player() -> PlayerService:
-    raise NotImplementedError
-
-
-# Keep a module-level reference set by main.py's dependency override
+# ----- Dependency placeholders (set by main.py) -----
 _player: PlayerService | None = None
+_obs: ObsService | None = None
 
 
 def set_player_ref(player: PlayerService) -> None:
-    """Called by main.py after wiring to give this module a direct reference."""
     global _player
     _player = player
+
+
+def set_obs_ref(obs: ObsService) -> None:
+    global _obs
+    _obs = obs
 
 
 # ----- Outbound: state broadcast -----
@@ -48,7 +51,6 @@ async def state_socket(websocket: WebSocket) -> None:
         try:
             queue.put_nowait({"event": event, "payload": payload})
         except asyncio.QueueFull:
-            # Drop oldest to make room — keeps the client from falling behind
             try:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -82,21 +84,6 @@ async def state_socket(websocket: WebSocket) -> None:
 # ----- Inbound: browser screen share -----
 @router.websocket("/ws/screen-share")
 async def screen_share_socket(websocket: WebSocket) -> None:
-    """
-    Receives frames from the browser's screen capture.
-
-    Protocol:
-      - Binary message: raw JPEG frame data → pushed to BrowserSource
-      - Text message: JSON control, e.g. {"action": "stop"}
-      - Close: browser stopped sharing
-
-    The frontend should:
-      1. POST /api/player/play { mode: "browser" }
-      2. Open this WebSocket
-      3. Use getDisplayMedia() + canvas to grab frames
-      4. Send each frame as a binary WebSocket message (JPEG blob)
-      5. On user stop: send {"action": "stop"} then close the socket
-    """
     await websocket.accept()
 
     if _player is None:
@@ -110,6 +97,13 @@ async def screen_share_socket(websocket: WebSocket) -> None:
         )
         return
 
+    # Switch OBS to the StreamScreen scene
+    if _obs is not None and _obs.is_connected():
+        try:
+            await _obs.switch_to_stream_screen()
+        except Exception as e:
+            print(f"[ws/screen-share] failed to switch OBS scene: {e}")
+
     print("[ws/screen-share] browser connected, receiving frames")
     frame_count = 0
 
@@ -118,7 +112,6 @@ async def screen_share_socket(websocket: WebSocket) -> None:
             message = await websocket.receive()
 
             if "bytes" in message and message["bytes"]:
-                # Binary = JPEG frame
                 try:
                     _player.push_browser_frame(message["bytes"])
                 except Exception as e:
@@ -126,7 +119,6 @@ async def screen_share_socket(websocket: WebSocket) -> None:
                 frame_count += 1
 
             elif "text" in message and message["text"]:
-                # Text = JSON control command
                 try:
                     cmd = json.loads(message["text"])
                     action = cmd.get("action", "")
@@ -147,3 +139,10 @@ async def screen_share_socket(websocket: WebSocket) -> None:
         )
         if _player.is_browser_active:
             _player.stop()
+    finally:
+        # Schedule delayed revert to previous scene
+        if _obs is not None and _obs.is_connected():
+            try:
+                await _obs.schedule_revert_scene()
+            except Exception as e:
+                print(f"[ws/screen-share] failed to schedule scene revert: {e}")

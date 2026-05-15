@@ -73,8 +73,9 @@ async def lifespan(app: FastAPI):
     event_bus.attach_loop(loop)
     container.player.attach_event_loop(loop)
 
-    # Give the WS route a direct reference to the player for screen-share
+    # Give the WS route direct references to player and OBS for screen-share
     routes_ws.set_player_ref(container.player)
+    routes_ws.set_obs_ref(container.obs)
 
     await container.startup()
     yield

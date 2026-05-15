@@ -5,6 +5,8 @@ Features:
   - Async connect/disconnect with auto-retry on failure
   - Scene listing and switching (the feature PlayerService needs)
   - Connection status tracking + event bus notifications
+  - Auto-provision of StreamScreen scene + NDI source on connect
+  - Auto-switch to StreamScreen on screen share, revert on stop
   - Graceful handling of OBS not running or refusing connections
 
 Requires OBS 28+ with WebSocket Server enabled:
@@ -13,7 +15,6 @@ Requires OBS 28+ with WebSocket Server enabled:
 from __future__ import annotations
 
 import asyncio
-import traceback
 from typing import List, Optional
 
 from core.events import Events, event_bus
@@ -34,6 +35,13 @@ class ObsService(IObsClient):
         self._client: Optional[obsws.ReqClient] = None
         self._connected = False
 
+        # Scene that was active before we switched to StreamScreen
+        self._previous_scene: Optional[str] = None
+        # Pending revert timer handle
+        self._revert_task: Optional[asyncio.TimerHandle] = None
+
+    # ---------------------------------------------------------------- connect
+
     async def connect(self) -> bool:
         """Connect to OBS WebSocket. Returns True on success."""
         if not OBSWS_AVAILABLE:
@@ -46,7 +54,6 @@ class ObsService(IObsClient):
         s = self._settings.get().obs
         loop = asyncio.get_running_loop()
         try:
-            # obsws-python is synchronous, so run in executor
             self._client = await loop.run_in_executor(
                 None,
                 lambda: obsws.ReqClient(
@@ -61,6 +68,10 @@ class ObsService(IObsClient):
             event_bus.publish_sync(
                 Events.OBS_STATUS_CHANGED, {"connected": True}
             )
+
+            # Auto-provision the screen share scene + source
+            await self._ensure_stream_screen()
+
             return True
         except Exception as e:
             self._connected = False
@@ -81,10 +92,13 @@ class ObsService(IObsClient):
                 pass
             self._client = None
         self._connected = False
+        self._previous_scene = None
         event_bus.publish_sync(Events.OBS_STATUS_CHANGED, {"connected": False})
 
     def is_connected(self) -> bool:
         return self._connected
+
+    # ---------------------------------------------------------------- scenes
 
     async def list_scenes(self) -> List[str]:
         """Return scene names in the order OBS reports them."""
@@ -131,11 +145,10 @@ class ObsService(IObsClient):
             self._mark_disconnected(e)
             return False
 
-    async def list_scene_items(self, scene_name: str) -> List[dict]:
-        """Return sources (scene items) for a given scene.
+    # ---------------------------------------------------------------- sources
 
-        Each item has: sceneItemId, sourceName, inputKind, sceneItemEnabled.
-        """
+    async def list_scene_items(self, scene_name: str) -> List[dict]:
+        """Return sources (scene items) for a given scene."""
         if not self._connected or self._client is None:
             return []
         loop = asyncio.get_running_loop()
@@ -178,6 +191,103 @@ class ObsService(IObsClient):
             print(f"[obs] set_scene_item_enabled failed: {e}")
             self._mark_disconnected(e)
             return False
+
+    # -------------------------------------------------------- stream screen
+
+    async def _ensure_stream_screen(self) -> None:
+        """Make sure the StreamScreen scene + NDI source exist in OBS."""
+        import dev_config
+        cfg = dev_config.get().screen_share_obs
+
+        if not self._connected or self._client is None:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        try:
+            # Check if scene exists
+            scenes = await self.list_scenes()
+            if cfg.scene_name not in scenes:
+                await loop.run_in_executor(
+                    None, self._client.create_scene, cfg.scene_name
+                )
+                print(f"[obs] created scene '{cfg.scene_name}'")
+
+            # Check if the NDI source already exists in the scene
+            items = await self.list_scene_items(cfg.scene_name)
+            source_exists = any(
+                item["sourceName"] == cfg.source_name for item in items
+            )
+
+            if not source_exists:
+                # Create the NDI input and add it to the scene
+                await loop.run_in_executor(
+                    None,
+                    self._client.create_input,
+                    cfg.scene_name,        # sceneName
+                    cfg.source_name,       # inputName
+                    cfg.ndi_input_kind,    # inputKind (e.g. "ndi_source")
+                    {"ndi_source_name": cfg.ndi_source_name},  # inputSettings
+                    True,                  # sceneItemEnabled
+                )
+                print(
+                    f"[obs] created NDI source '{cfg.source_name}' "
+                    f"(receiving from '{cfg.ndi_source_name}') "
+                    f"in scene '{cfg.scene_name}'"
+                )
+
+            print(f"[obs] StreamScreen provisioned: scene='{cfg.scene_name}', source='{cfg.source_name}'")
+
+        except Exception as e:
+            # Non-fatal — screen share will still work, just without
+            # automatic scene switching
+            print(f"[obs] WARNING: failed to provision StreamScreen: {e}")
+
+    async def switch_to_stream_screen(self) -> None:
+        """Switch OBS to the StreamScreen scene, remembering the previous one."""
+        import dev_config
+        cfg = dev_config.get().screen_share_obs
+
+        # Cancel any pending revert
+        if self._revert_task is not None:
+            self._revert_task.cancel()
+            self._revert_task = None
+
+        current = await self.get_current_scene()
+        if current and current != cfg.scene_name:
+            self._previous_scene = current
+
+        await self.set_current_scene(cfg.scene_name)
+        print(f"[obs] switched to StreamScreen (previous: {self._previous_scene})")
+
+    async def schedule_revert_scene(self) -> None:
+        """After screen share ends, wait then revert to the previous scene.
+
+        The delay allows for brief reconnects — if a new share starts
+        within the window, switch_to_stream_screen cancels the revert.
+        """
+        import dev_config
+        cfg = dev_config.get().screen_share_obs
+
+        if self._previous_scene is None:
+            return
+
+        previous = self._previous_scene
+
+        async def _do_revert():
+            await asyncio.sleep(cfg.switch_delay_sec)
+            # Only revert if we're still on StreamScreen and no new share started
+            current = await self.get_current_scene()
+            if current == cfg.scene_name:
+                await self.set_current_scene(previous)
+                print(f"[obs] reverted to scene '{previous}'")
+            self._previous_scene = None
+            self._revert_task = None
+
+        # Schedule the revert as an asyncio task
+        self._revert_task = asyncio.ensure_future(_do_revert())
+
+    # ---------------------------------------------------------------- internal
 
     def _mark_disconnected(self, error: Exception) -> None:
         """Mark as disconnected on any communication failure.
