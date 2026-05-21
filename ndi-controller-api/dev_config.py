@@ -25,7 +25,7 @@ class ScreenShareObs(BaseModel):
     """OBS scene/source that the app auto-provisions for screen sharing."""
     scene_name: str = "StreamScreen"
     source_name: str = "StreamScreen"
-    ndi_source_name: str = "OBS Video"  # NDI source name to receive from
+    ndi_source_name: str = "AV_Platform_NDI"  # NDI source name to receive from
     ndi_input_kind: str = "ndi_source"  # OBS input kind for NDI plugin
     switch_delay_sec: float = 2.0       # delay before reverting scene after share ends
 

@@ -3,16 +3,18 @@ import { api } from '../api.js';
 
 const RANGE = 2000; // ±2000 ms
 
-export default function OffsetSliders({ videoOffsetMs, audioOffsetMs }) {
+export default function OffsetSliders({ videoOffsetMs, audioOffsetMs, isLive }) {
   const [v, setV] = useState(videoOffsetMs);
   const [a, setA] = useState(audioOffsetMs);
   const debounce = useRef(null);
+  const disabled = !!isLive;
 
   // External (WS) updates flow in
   useEffect(() => setV(videoOffsetMs), [videoOffsetMs]);
   useEffect(() => setA(audioOffsetMs), [audioOffsetMs]);
 
   const send = (newV, newA) => {
+    if (disabled) return;
     clearTimeout(debounce.current);
     debounce.current = setTimeout(() => {
       api.setOffsets(newV, newA).catch((e) => console.warn(e));
@@ -23,6 +25,11 @@ export default function OffsetSliders({ videoOffsetMs, audioOffsetMs }) {
     <div className="panel">
       <div className="panel-header">Sync Offsets</div>
       <div className="panel-body">
+        {disabled && (
+          <div style={{ fontSize: 11, color: 'var(--warning)', marginBottom: 10 }}>
+            Offsets are disabled for live sources (screen/browser).
+          </div>
+        )}
         <div className="offset-group">
           <label>
             <span>Video → OBS</span>
@@ -33,6 +40,7 @@ export default function OffsetSliders({ videoOffsetMs, audioOffsetMs }) {
             min={-RANGE}
             max={RANGE}
             value={v}
+            disabled={disabled}
             onChange={(e) => {
               const nv = parseInt(e.target.value, 10);
               setV(nv);
@@ -54,6 +62,7 @@ export default function OffsetSliders({ videoOffsetMs, audioOffsetMs }) {
             min={-RANGE}
             max={RANGE}
             value={a}
+            disabled={disabled}
             onChange={(e) => {
               const na = parseInt(e.target.value, 10);
               setA(na);
@@ -67,7 +76,7 @@ export default function OffsetSliders({ videoOffsetMs, audioOffsetMs }) {
         </div>
 
         <div style={{ marginTop: 16, display: 'flex', gap: 6, justifyContent: 'center' }}>
-          <button onClick={() => { setV(0); setA(0); send(0, 0); }}>
+          <button disabled={disabled} onClick={() => { setV(0); setA(0); send(0, 0); }}>
             Reset both
           </button>
         </div>

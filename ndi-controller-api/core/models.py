@@ -69,7 +69,10 @@ class PlayerState(BaseModel):
     position_seconds: float = 0.0
     duration_seconds: float = 0.0
 
-    # Offsets in milliseconds — positive = delay this stream
+    # True when the active source is live (screen/browser) — offsets are blocked
+    is_live: bool = False
+
+    # Offsets in milliseconds — positive = delay this stream (file sources only)
     video_offset_ms: int = 0
     audio_offset_ms: int = 0
 
@@ -90,8 +93,8 @@ class ReaperSettings(BaseModel):
 
 
 class NdiSettings(BaseModel):
-    video_source_name: str = "OBS Video"
-    audio_source_name: str = "Reaper Audio"
+    video_source_name: str = "AV_Platform_NDI"
+    audio_source_name: str = "AV_Platform_NDI_Audio"
 
 
 class Settings(BaseModel):

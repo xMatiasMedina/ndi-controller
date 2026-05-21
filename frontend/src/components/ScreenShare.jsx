@@ -1,9 +1,21 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
 import { api } from '../api.js';
 
+/**
+ * ScreenShare — captures the user's screen via getDisplayMedia, draws frames
+ * to an off-screen canvas, encodes as JPEG, and sends over WebSocket to
+ * /ws/screen-share where the backend pipes it into NDI.
+ *
+ * Audio capture: if the browser supports it and the user allows it,
+ * captures system/tab audio via AudioContext + ScriptProcessorNode,
+ * encodes as raw float32 PCM, and sends with a 4-byte "AUD\x00" prefix
+ * so the backend can distinguish audio from video frames.
+ */
+
 const TARGET_FPS = 30;
 const JPEG_QUALITY = 0.75;
 const FRAME_INTERVAL = 1000 / TARGET_FPS;
+const AUDIO_MAGIC = new Uint8Array([0x41, 0x55, 0x44, 0x00]); // "AUD\x00"
 
 const isSecureContext =
     window.isSecureContext ||
@@ -14,11 +26,14 @@ const isSecureContext =
 export default function ScreenShare() {
     const [sharing, setSharing] = useState(false);
     const [error, setError] = useState(null);
+    const [hasAudio, setHasAudio] = useState(false);
     const streamRef = useRef(null);
     const wsRef = useRef(null);
     const timerRef = useRef(null);
     const canvasRef = useRef(null);
     const videoRef = useRef(null);
+    const audioCtxRef = useRef(null);
+    const audioProcessorRef = useRef(null);
     const cleaningUp = useRef(false);
 
     const cleanup = useCallback(() => {
@@ -28,6 +43,14 @@ export default function ScreenShare() {
         if (timerRef.current) {
             clearTimeout(timerRef.current);
             timerRef.current = null;
+        }
+        if (audioProcessorRef.current) {
+            try { audioProcessorRef.current.disconnect(); } catch {}
+            audioProcessorRef.current = null;
+        }
+        if (audioCtxRef.current) {
+            try { audioCtxRef.current.close(); } catch {}
+            audioCtxRef.current = null;
         }
         if (wsRef.current) {
             try { wsRef.current.close(); } catch {}
@@ -43,6 +66,7 @@ export default function ScreenShare() {
         }
         canvasRef.current = null;
         setSharing(false);
+        setHasAudio(false);
         cleaningUp.current = false;
     }, []);
 
@@ -63,9 +87,10 @@ export default function ScreenShare() {
     const startSharing = useCallback(async () => {
         setError(null);
         try {
+            // Request screen capture — ask for audio too
             const stream = await navigator.mediaDevices.getDisplayMedia({
                 video: { frameRate: { ideal: TARGET_FPS } },
-                audio: false,
+                audio: true,
             });
             streamRef.current = stream;
 
@@ -102,14 +127,13 @@ export default function ScreenShare() {
             ws.onopen = () => {
                 setSharing(true);
 
+                // --- Video capture loop ---
                 const ctx = canvas.getContext('2d');
                 let encoding = false;
 
                 const captureFrame = () => {
                     if (!wsRef.current || ws.readyState !== WebSocket.OPEN) return;
 
-                    // Schedule next frame — setTimeout works in background tabs
-                    // (throttled to 1/sec, but never stops like RAF does)
                     timerRef.current = setTimeout(captureFrame, FRAME_INTERVAL);
 
                     if (encoding) return;
@@ -130,6 +154,58 @@ export default function ScreenShare() {
                 };
 
                 timerRef.current = setTimeout(captureFrame, 0);
+
+                // --- Audio capture ---
+                const audioTracks = stream.getAudioTracks();
+                if (audioTracks.length > 0) {
+                    try {
+                        const audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+                            sampleRate: 48000,
+                        });
+                        audioCtxRef.current = audioCtx;
+
+                        const audioStream = new MediaStream(audioTracks);
+                        const source = audioCtx.createMediaStreamSource(audioStream);
+
+                        // ScriptProcessorNode: 4096 buffer, 2 in, 2 out
+                        const processor = audioCtx.createScriptProcessor(4096, 2, 2);
+                        audioProcessorRef.current = processor;
+
+                        processor.onaudioprocess = (e) => {
+                            if (!wsRef.current || ws.readyState !== WebSocket.OPEN) return;
+
+                            const left = e.inputBuffer.getChannelData(0);
+                            const right = e.inputBuffer.getChannelData(1);
+                            const numSamples = left.length;
+
+                            // Interleave stereo: [L0, R0, L1, R1, ...]
+                            const interleaved = new Float32Array(numSamples * 2);
+                            for (let i = 0; i < numSamples; i++) {
+                                interleaved[i * 2] = left[i];
+                                interleaved[i * 2 + 1] = right[i];
+                            }
+
+                            // Prefix with AUDIO_MAGIC
+                            const payload = new Uint8Array(
+                                AUDIO_MAGIC.byteLength + interleaved.byteLength
+                            );
+                            payload.set(AUDIO_MAGIC, 0);
+                            payload.set(
+                                new Uint8Array(interleaved.buffer),
+                                AUDIO_MAGIC.byteLength
+                            );
+
+                            ws.send(payload.buffer);
+                        };
+
+                        source.connect(processor);
+                        processor.connect(audioCtx.destination);
+
+                        setHasAudio(true);
+                    } catch (audioErr) {
+                        console.warn('[screen-share] audio capture failed:', audioErr);
+                    }
+                }
             };
 
             ws.onclose = () => {
@@ -186,6 +262,7 @@ export default function ScreenShare() {
             {sharing && (
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
                     Streaming to NDI at ~{TARGET_FPS} fps
+                    {hasAudio ? ' (with audio)' : ' (video only)'}
                 </div>
             )}
         </div>

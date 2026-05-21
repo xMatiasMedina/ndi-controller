@@ -153,6 +153,7 @@ class PlayerService:
             with self._state_lock:
                 self._state.status = PlaybackStatus.STOPPED
                 self._state.position_seconds = 0.0
+                self._state.is_live = False
             if self._settings.get().reaper.lockstep:
                 self._reaper.stop()
         self._publish_state_change()
@@ -184,6 +185,8 @@ class PlayerService:
         audio_offset_ms: Optional[int] = None,
     ) -> PlayerState:
         with self._state_lock:
+            if self._state.is_live:
+                return self._state.model_copy(deep=True)
             if video_offset_ms is not None:
                 self._state.video_offset_ms = video_offset_ms
             if audio_offset_ms is not None:
@@ -278,6 +281,7 @@ class PlayerService:
             self._state.status = PlaybackStatus.PLAYING
             self._state.position_seconds = 0.0
             self._state.duration_seconds = source.duration_seconds
+            self._state.is_live = source.duration_seconds == 0.0
 
         if self._settings.get().reaper.lockstep:
             self._reaper.seek(0.0)

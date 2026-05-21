@@ -129,4 +129,4 @@ class TestModels:
         s = Settings()
         assert s.obs.port == 4455
         assert s.reaper.lockstep is True
-        assert s.ndi.video_source_name == "OBS Video"
+        assert s.ndi.video_source_name == "AV_Platform_NDI"

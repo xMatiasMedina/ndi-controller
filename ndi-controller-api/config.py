@@ -13,8 +13,8 @@ PLAYLISTS_FILE = DATA_DIR / "playlists.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
 # NDI defaults — overridable in settings
-DEFAULT_NDI_VIDEO_NAME = "OBS Video"
-DEFAULT_NDI_AUDIO_NAME = "Reaper Audio"
+DEFAULT_NDI_VIDEO_NAME = "AV_Platform_NDI"
+DEFAULT_NDI_AUDIO_NAME = "AV_Platform_NDI_Audio"
 
 # Audio constants — NDI's preferred format
 AUDIO_SAMPLE_RATE = 48000

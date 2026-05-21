@@ -128,6 +128,7 @@ export default function App() {
                 <OffsetSliders
                     videoOffsetMs={state?.video_offset_ms ?? 0}
                     audioOffsetMs={state?.audio_offset_ms ?? 0}
+                    isLive={state?.is_live ?? false}
                 />
             )}
             {activeTab === 'obs' && <OBSPanel obsStatus={obsStatus} />}

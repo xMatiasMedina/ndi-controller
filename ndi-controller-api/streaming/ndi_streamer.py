@@ -3,15 +3,15 @@ Dual NDI streamer.
 
 Two NDI senders, each following cyndilib's canonical pattern:
 
-  * "OBS Video" — a video-only sender carrying the real video at the
+  * "AV_Platform_NDI" — a video-only sender carrying the real video at the
     source's native fps. Written from the video thread using write_video().
 
-  * "Reaper Audio" — a video+audio sender carrying a 16x16 black video AND
-    the real audio (or silence), both written atomically every 20 ms using
-    write_video_and_audio(). Reaper's NDI Input VST refuses to lock onto
-    sources where video and audio have mismatched cadences; by pairing a
-    tiny black frame to every audio chunk we get a clean 50 fps video +
-    48 kHz audio stream that the VST is happy with.
+  * "AV_Platform_NDI_Audio" — a video+audio sender carrying a 16x16 black
+    video AND the real audio (or silence), both written atomically every
+    20 ms using write_video_and_audio(). Reaper's NDI Input VST refuses to
+    lock onto sources where video and audio have mismatched cadences; by
+    pairing a tiny black frame to every audio chunk we get a clean 50 fps
+    video + 48 kHz audio stream that the VST is happy with.
 
 Reference level is set to dBFS_smpte (SMPTE -20 dBFS) on the audio frame,
 matching Reaper's default "Audio Level: -20dB (SMPTE level)".
@@ -318,9 +318,13 @@ class NDIStreamer:
 
     def _audio_loop(self) -> None:
         """
-        Writes to the 'Reaper Audio' sender. Every 20 ms calls
+        Writes to the audio sender. Every 20 ms calls
         write_video_and_audio() with a black 16x16 frame and the next audio
         chunk — one atomic operation.
+
+        For file sources: reads from the pre-decoded bulk audio buffer.
+        For live sources: pulls from the source's ring buffer via
+        get_audio_chunk() (ScreenSource / BrowserSource).
         """
         assert self._source is not None
         chunk = AUDIO_CHUNK_SAMPLES
@@ -333,21 +337,32 @@ class NDIStreamer:
             np.zeros((config.AUDIO_CHANNELS, chunk), dtype=np.float32)
         )
 
-        try:
-            if self._source.has_audio:
-                samples = self._source.get_audio()
-            else:
-                samples = np.zeros((0, config.AUDIO_CHANNELS), dtype=np.float32)
-        except Exception as e:
-            print(f"[ndi] failed to get audio: {e}")
-            samples = np.zeros((0, config.AUDIO_CHANNELS), dtype=np.float32)
+        # Determine if this source supports live audio chunk pulling
+        has_chunk_pull = hasattr(self._source, "get_audio_chunk")
 
-        total = samples.shape[0]
+        # For file sources, pre-load the entire audio buffer
+        samples = None
+        total = 0
         pos = 0
-        i = 0
+        if not has_chunk_pull:
+            try:
+                if self._source.has_audio:
+                    samples = self._source.get_audio()
+                else:
+                    samples = np.zeros(
+                        (0, config.AUDIO_CHANNELS), dtype=np.float32
+                    )
+            except Exception as e:
+                print(f"[ndi] failed to get audio: {e}")
+                samples = np.zeros(
+                    (0, config.AUDIO_CHANNELS), dtype=np.float32
+                )
+            total = samples.shape[0]
+
         pad_buffer = np.zeros(
             (chunk, config.AUDIO_CHANNELS), dtype=np.float32
         )
+        i = 0
 
         try:
             while not self._stop_event.is_set():
@@ -356,19 +371,34 @@ class NDIStreamer:
                 if self._stop_event.is_set():
                     return
 
-                if pos < total:
-                    end = min(pos + chunk, total)
-                    block = samples[pos:end]
-                    if block.shape[0] < chunk:
-                        pad_buffer[:] = 0
-                        pad_buffer[: block.shape[0]] = block
-                        block = pad_buffer
-                    if self._muted:
-                        block = np.zeros_like(block)
-                    planar = np.ascontiguousarray(block.T.astype(np.float32))
-                    pos = end
+                if has_chunk_pull:
+                    # Live source: pull from ring buffer
+                    if self._source.has_audio:
+                        block = self._source.get_audio_chunk(chunk)
+                        if self._muted:
+                            block = np.zeros_like(block)
+                        planar = np.ascontiguousarray(
+                            block.T.astype(np.float32)
+                        )
+                    else:
+                        planar = silence
                 else:
-                    planar = silence
+                    # File source: read from pre-decoded buffer
+                    if pos < total:
+                        end = min(pos + chunk, total)
+                        block = samples[pos:end]
+                        if block.shape[0] < chunk:
+                            pad_buffer[:] = 0
+                            pad_buffer[: block.shape[0]] = block
+                            block = pad_buffer
+                        if self._muted:
+                            block = np.zeros_like(block)
+                        planar = np.ascontiguousarray(
+                            block.T.astype(np.float32)
+                        )
+                        pos = end
+                    else:
+                        planar = silence
 
                 target = (
                     self._t0
