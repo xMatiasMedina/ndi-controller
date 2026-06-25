@@ -60,6 +60,8 @@ class PlayerService:
         self._streamer: Optional[NDIStreamer] = None
         self._browser_source = None
         self._generation = 0
+        # True while the auto-started default playlist is the active content.
+        self._is_default_active = False
 
     # ---------------------------------------------------------------- public
     def get_state(self) -> PlayerState:
@@ -76,6 +78,8 @@ class PlayerService:
     ) -> PlayerState:
         """Start playback. Stops any current playback first."""
         with self._lifecycle_lock:
+            # A manual play takes over from the default resting state.
+            self._is_default_active = False
             self._stop_streamer()
 
             with self._state_lock:
@@ -149,14 +153,21 @@ class PlayerService:
 
     def stop(self) -> PlayerState:
         with self._lifecycle_lock:
+            was_default = self._is_default_active
             self._stop_streamer()
+            self._is_default_active = False
             with self._state_lock:
                 self._state.status = PlaybackStatus.STOPPED
                 self._state.position_seconds = 0.0
                 self._state.is_live = False
             if self._settings.get().reaper.lockstep:
                 self._reaper.stop()
-        self._publish_state_change()
+            self._publish_state_change()
+            # Return to the default playlist (the resting state) unless what we
+            # just stopped WAS the default — stopping the default is a real
+            # "off" (escape hatch), otherwise it could never be silenced.
+            if not was_default:
+                self._maybe_start_default_locked()
         return self.get_state()
 
     def seek(self, position_seconds: float) -> PlayerState:
@@ -224,6 +235,56 @@ class PlayerService:
     def shutdown(self) -> None:
         with self._lifecycle_lock:
             self._stop_streamer()
+
+    # ----------------------------------------------------------- default loop
+    def start_default(self) -> None:
+        """Start the default playlist if one is set and nothing is playing.
+        Called once at startup so the screens are never blank by default."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                status = self._state.status
+            if status == PlaybackStatus.STOPPED:
+                self._maybe_start_default_locked()
+
+    def refresh_default(self) -> None:
+        """Re-evaluate the default after the selection changed in settings.
+        Start it if idle, or restart it if the default is what's currently
+        showing so the new selection takes effect immediately. Never interrupts
+        manual playback or a live stream."""
+        with self._lifecycle_lock:
+            with self._state_lock:
+                status = self._state.status
+            if status == PlaybackStatus.STOPPED or self._is_default_active:
+                self._maybe_start_default_locked()
+
+    def _maybe_start_default_locked(self) -> None:
+        """Start the configured default playlist, looping, as the resting state.
+        No-op if no default is set or it is empty/missing.
+        Caller must hold _lifecycle_lock."""
+        default_id = self._settings.get().default_playlist_id
+        if not default_id:
+            return
+        playlist = self._playlists.get_playlist(default_id)
+        if not playlist or not playlist.video_ids:
+            return
+
+        self._stop_streamer()
+        with self._state_lock:
+            self._state.mode = PlaybackMode.PLAYLIST
+            self._state.loop = True
+            self._state.current_playlist_id = default_id
+            self._state.playlist_cursor = 0
+            self._state.current_video_id = playlist.video_ids[0]
+            snap_video_id = self._state.current_video_id
+            snap_v_off = self._state.video_offset_ms
+            snap_a_off = self._state.audio_offset_ms
+            snap_muted = self._state.muted
+
+        self._is_default_active = True
+        self._start_source(
+            PlaybackMode.PLAYLIST, snap_video_id, 0,
+            snap_v_off, snap_a_off, snap_muted,
+        )
 
     # --------------------------------------------------------------- private
     def _stop_streamer(self) -> None:
@@ -327,8 +388,12 @@ class PlayerService:
                     snap_muted = self._state.muted
 
             if should_stop:
+                was_default = self._is_default_active
                 self._stop_streamer()
+                self._is_default_active = False
                 self._publish_state_change()
+                if not was_default:
+                    self._maybe_start_default_locked()
                 return self.get_state()
 
             self._stop_streamer()

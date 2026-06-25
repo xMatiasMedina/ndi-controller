@@ -98,4 +98,20 @@ export const api = {
     getSettings: () => request('/api/settings'),
     updateSettings: (settings) =>
         request('/api/settings', { method: 'PUT', body: JSON.stringify(settings) }),
+
+    // Screens (Modbus relay)
+    getScreens: () => request('/api/screens'),
+    screensAll: (action) =>
+        request(`/api/screens/all/${action}`, { method: 'POST' }),
+    screensGroup: (groupId, action) =>
+        request(`/api/screens/group/${encodeURIComponent(groupId)}/${action}`, {
+            method: 'POST',
+        }),
+
+    // Default playlist (resting-state loop)
+    setDefaultPlaylist: (playlist_id) =>
+        request('/api/default-playlist', {
+            method: 'POST',
+            body: JSON.stringify({ playlist_id }),
+        }),
 };

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,7 @@ from api import (
     routes_ws,
 )
 from services.library_service import LibraryService
+from services.modbus_service import ModbusService
 from services.obs_service import ObsService
 from services.persistence_service import JsonPersistenceService
 from services.player_service import PlayerService
@@ -41,6 +43,7 @@ class Container:
         self.playlists = PlaylistService(self.persistence, self.library)
         self.obs = ObsService(self.settings)
         self.reaper = ReaperService(self.settings)
+        self.modbus = ModbusService(self.settings)
         self.player = PlayerService(
             library=self.library,
             playlists=self.playlists,
@@ -56,9 +59,16 @@ class Container:
         if not connected:
             print("[startup] OBS not available — will retry when needed")
 
+        # Begin the default playlist (resting state) if one is configured.
+        # Run in a thread — opening a file source can decode audio (blocking).
+        import asyncio
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.player.start_default)
+
     async def shutdown(self) -> None:
         self.player.shutdown()
         await self.obs.disconnect()
+        await self.modbus.disconnect()
 
 
 container = Container()
@@ -166,15 +176,72 @@ async def obs_set_source_enabled(scene_name: str, item_id: int, body: SetSourceE
     return {"sceneItemId": item_id, "enabled": body.enabled}
 
 
-# Serve the built React frontend if present (production mode)
-frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
-if frontend_dist.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
+# ---- Screen power routes (Modbus relay board) ----
+@app.get("/api/screens")
+async def screens_state():
+    return await container.modbus.read_states()
+
+
+@app.post("/api/screens/all/{action}")
+async def screens_all(action: str):
+    if action not in ("on", "off"):
+        raise HTTPException(status_code=400, detail="action must be 'on' or 'off'")
+    ok = await container.modbus.set_all(action == "on")
+    return {"ok": ok}
+
+
+@app.post("/api/screens/group/{group_id}/{action}")
+async def screens_group(group_id: str, action: str):
+    if action not in ("on", "off"):
+        raise HTTPException(status_code=400, detail="action must be 'on' or 'off'")
+    groups = container.settings.get().modbus.groups
+    group = next((g for g in groups if g.id == group_id), None)
+    if group is None:
+        raise HTTPException(status_code=404, detail=f"Unknown screen group: {group_id}")
+    ok = await container.modbus.set_channels(group.channels, action == "on")
+    return {"ok": ok}
+
+
+# ---- Default playlist (resting-state loop) ----
+class DefaultPlaylistBody(BaseModel):
+    playlist_id: Optional[str] = None
+
+
+@app.post("/api/default-playlist")
+async def set_default_playlist(body: DefaultPlaylistBody):
+    s = container.settings.get()
+    s.default_playlist_id = body.playlist_id
+    container.settings.update(s)
+    # Apply right away: start it if idle, or swap if the default is showing.
+    import asyncio
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, container.player.refresh_default)
+    return {"default_playlist_id": body.playlist_id}
 
 
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+# ---- Frontend (built React app) ----
+from fastapi.responses import FileResponse
+
+frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+
+
+@app.get("/remote")
+async def remote_page():
+    """Serve the SPA shell for the simple remote page (client-side route)."""
+    index = frontend_dist / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
+    raise HTTPException(status_code=404, detail="frontend not built")
+
+
+# Serve the built React frontend if present (production mode)
+if frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
 
 
 # ----------------------------------------------------------------- dev runner

@@ -5,10 +5,17 @@ export default function Playlist({ currentPlaylistId, loop, onPlay, onLoopChange
   const [playlists, setPlaylists] = useState([]);
   const [videos, setVideos] = useState([]);
   const [newName, setNewName] = useState('');
+  const [defaultId, setDefaultId] = useState(null);
 
   const reload = async () => {
     setPlaylists(await api.listPlaylists());
     setVideos(await api.listVideos());
+    try {
+      const s = await api.getSettings();
+      setDefaultId(s.default_playlist_id ?? null);
+    } catch {
+      /* ignore — default star just won't show */
+    }
   };
 
   useEffect(() => {
@@ -27,6 +34,16 @@ export default function Playlist({ currentPlaylistId, loop, onPlay, onLoopChange
     if (!confirm('Delete this playlist?')) return;
     await api.removePlaylist(id);
     await reload();
+  };
+
+  const onToggleDefault = async (id, e) => {
+    e.stopPropagation();
+    try {
+      await api.setDefaultPlaylist(defaultId === id ? null : id);
+      await reload();
+    } catch (err) {
+      alert(err.message);
+    }
   };
 
   const onAddVideo = async (playlistId, videoId) => {
@@ -88,12 +105,26 @@ export default function Playlist({ currentPlaylistId, loop, onPlay, onLoopChange
                   <div>{p.name}</div>
                   <div className="meta">{p.video_ids.length} items</div>
                 </div>
-                <button
-                  onClick={(e) => onRemove(p.id, e)}
-                  style={{ padding: '2px 8px', fontSize: 11 }}
-                >
-                  ×
-                </button>
+                <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                  <button
+                    onClick={(e) => onToggleDefault(p.id, e)}
+                    className={`star-btn ${defaultId === p.id ? 'is-default' : ''}`}
+                    title={
+                      defaultId === p.id
+                        ? 'Default playlist — auto-plays when idle (click to unset)'
+                        : 'Set as default (auto-plays when nothing else is on)'
+                    }
+                    style={{ padding: '2px 6px', fontSize: 14 }}
+                  >
+                    {defaultId === p.id ? '★' : '☆'}
+                  </button>
+                  <button
+                    onClick={(e) => onRemove(p.id, e)}
+                    style={{ padding: '2px 8px', fontSize: 11 }}
+                  >
+                    ×
+                  </button>
+                </div>
               </div>
 
               {p.video_ids.length > 0 && (

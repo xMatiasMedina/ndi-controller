@@ -83,6 +83,13 @@ export default function App() {
             <span className={`pill ${reaperConfigured ? 'live' : 'off'}`}>
             <span className="dot" /> Reaper {reaperConfigured ? 'ready' : 'off'}
           </span>
+            <a
+                href="/remote"
+                className="header-link"
+                title="Open the simple cast remote"
+            >
+              Remote
+            </a>
             <button
                 onClick={() => setShowSettings(true)}
                 className="settings-btn"

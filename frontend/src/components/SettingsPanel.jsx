@@ -18,6 +18,19 @@ export default function SettingsPanel({ onClose }) {
         setSaved(false);
     };
 
+    const updateGroup = (index, field, value) => {
+        setSettings((prev) => ({
+            ...prev,
+            modbus: {
+                ...prev.modbus,
+                groups: prev.modbus.groups.map((g, i) =>
+                    i === index ? { ...g, [field]: value } : g
+                ),
+            },
+        }));
+        setSaved(false);
+    };
+
     const onSave = async () => {
         setSaving(true);
         try {
@@ -139,6 +152,74 @@ export default function SettingsPanel({ onClose }) {
                             />
                         </div>
                     </div>
+
+                    {/* Screens / Modbus relay */}
+                    {settings.modbus && (
+                        <div className="settings-section">
+                            <div className="settings-section-title">Screens (Modbus relay)</div>
+                            <div className="settings-row">
+                                <label>Host</label>
+                                <input
+                                    type="text"
+                                    value={settings.modbus.host}
+                                    onChange={(e) => update('modbus', 'host', e.target.value)}
+                                />
+                            </div>
+                            <div className="settings-row">
+                                <label>Port</label>
+                                <input
+                                    type="number"
+                                    value={settings.modbus.port}
+                                    onChange={(e) => update('modbus', 'port', parseInt(e.target.value) || 0)}
+                                />
+                            </div>
+                            <div className="settings-row">
+                                <label>Unit ID</label>
+                                <input
+                                    type="number"
+                                    value={settings.modbus.unit_id}
+                                    onChange={(e) => update('modbus', 'unit_id', parseInt(e.target.value) || 0)}
+                                />
+                            </div>
+                            <div className="settings-row">
+                                <label>Channels</label>
+                                <input
+                                    type="number"
+                                    value={settings.modbus.num_channels}
+                                    onChange={(e) => update('modbus', 'num_channels', parseInt(e.target.value) || 0)}
+                                />
+                            </div>
+                            <div className="settings-subtitle">
+                                Screen groups — channels comma-separated
+                            </div>
+                            {settings.modbus.groups.map((g, i) => (
+                                <div className="settings-row group-row" key={g.id}>
+                                    <input
+                                        className="group-name"
+                                        type="text"
+                                        value={g.name}
+                                        onChange={(e) => updateGroup(i, 'name', e.target.value)}
+                                    />
+                                    <input
+                                        className="group-channels"
+                                        type="text"
+                                        value={g.channels.join(', ')}
+                                        placeholder="e.g. 7, 8"
+                                        onChange={(e) =>
+                                            updateGroup(
+                                                i,
+                                                'channels',
+                                                e.target.value
+                                                    .split(',')
+                                                    .map((s) => parseInt(s.trim(), 10))
+                                                    .filter((n) => !isNaN(n))
+                                            )
+                                        }
+                                    />
+                                </div>
+                            ))}
+                        </div>
+                    )}
 
                     <div style={{ display: 'flex', gap: 8, marginTop: 20, justifyContent: 'flex-end' }}>
                         {saved && (

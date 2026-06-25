@@ -97,10 +97,39 @@ class NdiSettings(BaseModel):
     audio_source_name: str = "AV_Platform_NDI_Audio"
 
 
+class ScreenGroup(BaseModel):
+    """A named set of relay channels controlled together (a zone of screens)."""
+    id: str
+    name: str
+    channels: List[int] = Field(default_factory=list)
+
+
+class ModbusSettings(BaseModel):
+    """Modbus TCP relay board that powers the physical screens.
+
+    Channel N maps to coil N-1 on the board (Waveshare 8-ch). Groups let the
+    simple remote expose friendly buttons (e.g. "Led Oficina" = channel 1).
+    """
+    host: str = "10.10.30.2"
+    port: int = 502
+    unit_id: int = 1
+    num_channels: int = 8
+    groups: List[ScreenGroup] = Field(
+        default_factory=lambda: [
+            ScreenGroup(id="office", name="Led Oficina", channels=[1]),
+            ScreenGroup(id="warehouse", name="Led Almacen", channels=[7, 8]),
+        ]
+    )
+
+
 class Settings(BaseModel):
     obs: ObsSettings = Field(default_factory=ObsSettings)
     reaper: ReaperSettings = Field(default_factory=ReaperSettings)
     ndi: NdiSettings = Field(default_factory=NdiSettings)
+    modbus: ModbusSettings = Field(default_factory=ModbusSettings)
+
+    # Playlist that auto-plays (looping) whenever nothing else is active.
+    default_playlist_id: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
