@@ -114,4 +114,25 @@ export const api = {
             method: 'POST',
             body: JSON.stringify({ playlist_id }),
         }),
+
+    // Cast the /remote dashboard to a Google Nest Hub
+    castStatus: () => request('/api/cast/status'),
+    castStart: (ip, url) =>
+        request('/api/cast/start', {
+            method: 'POST',
+            body: JSON.stringify(url ? { ip, url } : { ip }),
+        }),
+    castStop: () => request('/api/cast/stop', { method: 'POST' }),
+
+    // WebRTC screen share (WHIP — raw SDP in, raw SDP answer out)
+    screenShareWhip: async (sdp) => {
+        const res = await fetch('/api/screen-share/whip', {
+            method: 'POST',
+            headers: { 'content-type': 'application/sdp' },
+            body: sdp,
+        });
+        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        return res.text();
+    },
+    screenShareStop: () => request('/api/screen-share/stop', { method: 'POST' }),
 };

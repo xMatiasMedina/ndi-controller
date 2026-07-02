@@ -56,7 +56,11 @@ class PlaybackStatus(str, Enum):
 class PlayerState(BaseModel):
     status: PlaybackStatus = PlaybackStatus.STOPPED
     mode: PlaybackMode = PlaybackMode.SINGLE
-    loop: bool = False
+    # Loop preference: 'off' | 'all' | 'one'. 'all'/'one' are persistent user
+    # choices (shown blue) that carry across media; 'off' means no user loop.
+    # The default playlist still loops as the resting state even when 'off'
+    # (shown yellow) — see is_default below.
+    loop_mode: str = "off"
     muted: bool = False
 
     # What's loaded
@@ -69,12 +73,28 @@ class PlayerState(BaseModel):
     position_seconds: float = 0.0
     duration_seconds: float = 0.0
 
-    # True when the active source is live (screen/browser) — offsets are blocked
+    # True when the active source is live (screen/browser).
     is_live: bool = False
+    # True when the active content is the auto-resume default playlist. Drives
+    # the UI's "yellow" loop state: it's looping only because it's the default,
+    # so loop won't carry over when the user switches to other media.
+    is_default: bool = False
 
-    # Offsets in milliseconds — positive = delay this stream (file sources only)
+    # Offsets in milliseconds — positive = delay this stream. For file sources
+    # they shift the frame scheduler; for live (screen/browser) they delay the
+    # stream in the WebRTC→NDI pipeline when the matching *_enabled flag is set.
     video_offset_ms: int = 0
     audio_offset_ms: int = 0
+    # Whether each offset is applied (UI checkbox). When off the offset is
+    # bypassed entirely — for live that means no delay buffer (minimal latency).
+    # Default on, but with a 0 ms value that's a no-op until the slider moves.
+    video_offset_enabled: bool = True
+    audio_offset_enabled: bool = True
+
+    # The configured auto-resume default playlist (mirrors settings). Surfaced
+    # in player state so the UI updates live when it changes — including from
+    # Home Assistant — instead of only on a page reload.
+    default_playlist_id: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
@@ -122,11 +142,27 @@ class ModbusSettings(BaseModel):
     )
 
 
+class ScreenShareSettings(BaseModel):
+    """WebRTC encode settings for the browser screen-share → NDI path.
+
+    Read by the frontend when a share starts (applied to getDisplayMedia + the
+    RTCRtpSender). Sharpness on the wall comes from RESOLUTION, not bitrate:
+    capture is capped at max_width/max_height (match the OBS canvas), the encoder
+    keeps full resolution and sheds frames if constrained, and bitrate is just
+    generous headroom. The wall runs ~20 fps, so fps above that is wasted.
+    """
+    max_bitrate_mbps: int = 40  # bit budget cap (encoder uses ≤ this; not the sharpness lever)
+    framerate: int = 24         # capture + encode fps (wall runs ~20)
+    max_width: int = 1920       # capture resolution cap — the real sharpness lever
+    max_height: int = 1080      # (a larger source is cleanly downscaled to this)
+
+
 class Settings(BaseModel):
     obs: ObsSettings = Field(default_factory=ObsSettings)
     reaper: ReaperSettings = Field(default_factory=ReaperSettings)
     ndi: NdiSettings = Field(default_factory=NdiSettings)
     modbus: ModbusSettings = Field(default_factory=ModbusSettings)
+    screen_share: ScreenShareSettings = Field(default_factory=ScreenShareSettings)
 
     # Playlist that auto-plays (looping) whenever nothing else is active.
     default_playlist_id: Optional[str] = None
@@ -154,7 +190,9 @@ class PlayRequest(BaseModel):
     video_id: Optional[str] = None      # for SINGLE
     playlist_id: Optional[str] = None   # for PLAYLIST
     monitor_index: Optional[int] = None  # for SCREEN
-    loop: bool = False
+    # Optional loop preference to apply with this play ('off'|'all'|'one'). When
+    # omitted the player keeps its current (persistent) loop_mode.
+    loop_mode: Optional[str] = None
 
 
 class SeekRequest(BaseModel):
@@ -164,7 +202,13 @@ class SeekRequest(BaseModel):
 class OffsetsRequest(BaseModel):
     video_offset_ms: Optional[int] = None
     audio_offset_ms: Optional[int] = None
+    video_offset_enabled: Optional[bool] = None
+    audio_offset_enabled: Optional[bool] = None
 
 
 class MuteRequest(BaseModel):
     muted: bool
+
+
+class LoopRequest(BaseModel):
+    loop_mode: str  # 'off' | 'all' | 'one'

@@ -2,20 +2,12 @@ import { useRef, useState, useCallback, useEffect } from 'react';
 import { api } from '../api.js';
 
 /**
- * ScreenShare — captures the user's screen via getDisplayMedia, draws frames
- * to an off-screen canvas, encodes as JPEG, and sends over WebSocket to
- * /ws/screen-share where the backend pipes it into NDI.
- *
- * Audio capture: if the browser supports it and the user allows it,
- * captures system/tab audio via AudioContext + ScriptProcessorNode,
- * encodes as raw float32 PCM, and sends with a 4-byte "AUD\x00" prefix
- * so the backend can distinguish audio from video frames.
+ * ScreenShare — captures the screen via getDisplayMedia and sends it to the
+ * station over WebRTC (WHIP, H.264 + Opus). The station decodes the video on
+ * the Intel iGPU (VAAPI) and republishes it as NDI. This replaces the old
+ * JPEG-over-WebSocket path (which encoded on the main thread and choked /
+ * froze on minimize). WebRTC encodes on the GPU, off the main thread.
  */
-
-const TARGET_FPS = 30;
-const JPEG_QUALITY = 0.75;
-const FRAME_INTERVAL = 1000 / TARGET_FPS;
-const AUDIO_MAGIC = new Uint8Array([0x41, 0x55, 0x44, 0x00]); // "AUD\x00"
 
 const isSecureContext =
     window.isSecureContext ||
@@ -27,205 +19,94 @@ export default function ScreenShare() {
     const [sharing, setSharing] = useState(false);
     const [error, setError] = useState(null);
     const [hasAudio, setHasAudio] = useState(false);
+    const pcRef = useRef(null);
     const streamRef = useRef(null);
-    const wsRef = useRef(null);
-    const timerRef = useRef(null);
-    const canvasRef = useRef(null);
-    const videoRef = useRef(null);
-    const audioCtxRef = useRef(null);
-    const audioProcessorRef = useRef(null);
     const cleaningUp = useRef(false);
 
     const cleanup = useCallback(() => {
         if (cleaningUp.current) return;
         cleaningUp.current = true;
-
-        if (timerRef.current) {
-            clearTimeout(timerRef.current);
-            timerRef.current = null;
-        }
-        if (audioProcessorRef.current) {
-            try { audioProcessorRef.current.disconnect(); } catch {}
-            audioProcessorRef.current = null;
-        }
-        if (audioCtxRef.current) {
-            try { audioCtxRef.current.close(); } catch {}
-            audioCtxRef.current = null;
-        }
-        if (wsRef.current) {
-            try { wsRef.current.close(); } catch {}
-            wsRef.current = null;
+        if (pcRef.current) {
+            try { pcRef.current.close(); } catch {}
+            pcRef.current = null;
         }
         if (streamRef.current) {
             streamRef.current.getTracks().forEach((t) => t.stop());
             streamRef.current = null;
         }
-        if (videoRef.current) {
-            videoRef.current.srcObject = null;
-            videoRef.current = null;
-        }
-        canvasRef.current = null;
         setSharing(false);
         setHasAudio(false);
         cleaningUp.current = false;
     }, []);
 
     const stopSharing = useCallback(async () => {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            try {
-                wsRef.current.send(JSON.stringify({ action: 'stop' }));
-            } catch {}
-        }
         cleanup();
-        try { await api.stop(); } catch {}
+        try { await api.screenShareStop(); } catch {}
     }, [cleanup]);
 
-    useEffect(() => {
-        return () => cleanup();
-    }, [cleanup]);
+    useEffect(() => () => cleanup(), [cleanup]);
 
     const startSharing = useCallback(async () => {
         setError(null);
         try {
-            // Request screen capture — ask for audio too
             const stream = await navigator.mediaDevices.getDisplayMedia({
-                video: { frameRate: { ideal: TARGET_FPS } },
+                video: { frameRate: { ideal: 30 } },
                 audio: true,
             });
             streamRef.current = stream;
 
-            stream.getVideoTracks()[0].onended = () => {
-                cleanup();
-                api.stop().catch(() => {});
-            };
+            const videoTrack = stream.getVideoTracks()[0];
+            videoTrack.contentHint = 'detail';
+            videoTrack.onended = () => stopSharing();
 
-            const video = document.createElement('video');
-            video.srcObject = stream;
-            video.muted = true;
-            await video.play();
-            videoRef.current = video;
+            const pc = new RTCPeerConnection();
+            pcRef.current = pc;
 
-            await new Promise((resolve) => {
-                const check = () => {
-                    if (video.videoWidth > 0) resolve();
-                    else setTimeout(check, 50);
-                };
-                check();
-            });
+            // Video: prefer H.264 so the station decodes it with vah264dec (VAAPI).
+            const vtx = pc.addTransceiver(videoTrack, { direction: 'sendonly' });
+            try {
+                const caps = RTCRtpSender.getCapabilities('video');
+                const h264 = caps.codecs.filter((c) => c.mimeType === 'video/H264');
+                if (h264.length && vtx.setCodecPreferences) vtx.setCodecPreferences(h264);
+            } catch {}
 
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            canvasRef.current = canvas;
+            const audioTrack = stream.getAudioTracks()[0];
+            if (audioTrack) {
+                pc.addTransceiver(audioTrack, { direction: 'sendonly' });
+                setHasAudio(true);
+            }
 
-            await api.play({ mode: 'browser' });
-
-            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const ws = new WebSocket(`${proto}//${window.location.host}/ws/screen-share`);
-            wsRef.current = ws;
-
-            ws.onopen = () => {
-                setSharing(true);
-
-                // --- Video capture loop ---
-                const ctx = canvas.getContext('2d');
-                let encoding = false;
-
-                const captureFrame = () => {
-                    if (!wsRef.current || ws.readyState !== WebSocket.OPEN) return;
-
-                    timerRef.current = setTimeout(captureFrame, FRAME_INTERVAL);
-
-                    if (encoding) return;
-                    if (ws.bufferedAmount > 0) return;
-
-                    encoding = true;
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                    canvas.toBlob(
-                        (blob) => {
-                            encoding = false;
-                            if (blob && wsRef.current && ws.readyState === WebSocket.OPEN) {
-                                ws.send(blob);
-                            }
-                        },
-                        'image/jpeg',
-                        JPEG_QUALITY,
-                    );
-                };
-
-                timerRef.current = setTimeout(captureFrame, 0);
-
-                // --- Audio capture ---
-                const audioTracks = stream.getAudioTracks();
-                if (audioTracks.length > 0) {
-                    try {
-                        const audioCtx = new (window.AudioContext || window.webkitAudioContext)({
-                            sampleRate: 48000,
-                        });
-                        audioCtxRef.current = audioCtx;
-
-                        const audioStream = new MediaStream(audioTracks);
-                        const source = audioCtx.createMediaStreamSource(audioStream);
-
-                        // ScriptProcessorNode: 4096 buffer, 2 in, 2 out
-                        const processor = audioCtx.createScriptProcessor(4096, 2, 2);
-                        audioProcessorRef.current = processor;
-
-                        processor.onaudioprocess = (e) => {
-                            if (!wsRef.current || ws.readyState !== WebSocket.OPEN) return;
-
-                            const left = e.inputBuffer.getChannelData(0);
-                            const right = e.inputBuffer.getChannelData(1);
-                            const numSamples = left.length;
-
-                            // Interleave stereo: [L0, R0, L1, R1, ...]
-                            const interleaved = new Float32Array(numSamples * 2);
-                            for (let i = 0; i < numSamples; i++) {
-                                interleaved[i * 2] = left[i];
-                                interleaved[i * 2 + 1] = right[i];
-                            }
-
-                            // Prefix with AUDIO_MAGIC
-                            const payload = new Uint8Array(
-                                AUDIO_MAGIC.byteLength + interleaved.byteLength
-                            );
-                            payload.set(AUDIO_MAGIC, 0);
-                            payload.set(
-                                new Uint8Array(interleaved.buffer),
-                                AUDIO_MAGIC.byteLength
-                            );
-
-                            ws.send(payload.buffer);
-                        };
-
-                        source.connect(processor);
-                        processor.connect(audioCtx.destination);
-
-                        setHasAudio(true);
-                    } catch (audioErr) {
-                        console.warn('[screen-share] audio capture failed:', audioErr);
-                    }
+            pc.onconnectionstatechange = () => {
+                const s = pc.connectionState;
+                if (s === 'failed' || s === 'closed' || s === 'disconnected') {
+                    stopSharing();
                 }
             };
 
-            ws.onclose = () => {
-                cleanup();
-            };
+            await pc.setLocalDescription(await pc.createOffer());
+            // Non-trickle WHIP: wait for ICE gathering, then send the full offer.
+            await new Promise((resolve) => {
+                if (pc.iceGatheringState === 'complete') return resolve();
+                const check = () => {
+                    if (pc.iceGatheringState === 'complete') {
+                        pc.removeEventListener('icegatheringstatechange', check);
+                        resolve();
+                    }
+                };
+                pc.addEventListener('icegatheringstatechange', check);
+                setTimeout(resolve, 3000);
+            });
 
-            ws.onerror = (e) => {
-                console.error('[screen-share] WS error', e);
-                setError('WebSocket connection failed');
-                cleanup();
-            };
+            const answer = await api.screenShareWhip(pc.localDescription.sdp);
+            await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+            setSharing(true);
         } catch (e) {
-            if (e.name === 'NotAllowedError') {
-                return;
-            }
+            if (e.name === 'NotAllowedError') return;
             console.error('[screen-share] start failed:', e);
             setError(e.message);
             cleanup();
         }
-    }, [cleanup]);
+    }, [cleanup, stopSharing]);
 
     if (!isSecureContext) {
         return (
@@ -247,10 +128,7 @@ export default function ScreenShare() {
                     <span className="screen-share-icon">⊞</span> Share Screen
                 </button>
             ) : (
-                <button
-                    className="screen-share-btn stop"
-                    onClick={stopSharing}
-                >
+                <button className="screen-share-btn stop" onClick={stopSharing}>
                     <span className="screen-share-icon pulse">●</span> Stop Sharing
                 </button>
             )}
@@ -261,8 +139,7 @@ export default function ScreenShare() {
             )}
             {sharing && (
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-                    Streaming to NDI at ~{TARGET_FPS} fps
-                    {hasAudio ? ' (with audio)' : ' (video only)'}
+                    Streaming to NDI via WebRTC{hasAudio ? ' (with audio)' : ' (video only)'}
                 </div>
             )}
         </div>

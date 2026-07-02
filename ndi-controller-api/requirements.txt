@@ -11,3 +11,4 @@ python-osc==1.9.0
 python-multipart==0.0.12
 sounddevice==0.5.1
 pymodbus==3.12.1
+catt==0.13.1

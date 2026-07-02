@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.models import (
+    LoopRequest,
     MuteRequest,
     OffsetsRequest,
     PlayerState,
@@ -34,7 +35,7 @@ def play(
             video_id=req.video_id,
             playlist_id=req.playlist_id,
             monitor_index=req.monitor_index,
-            loop=req.loop,
+            loop_mode=req.loop_mode,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -78,7 +79,12 @@ def previous_track(player: PlayerService = Depends(get_player)) -> PlayerState:
 def set_offsets(
     req: OffsetsRequest, player: PlayerService = Depends(get_player)
 ) -> PlayerState:
-    return player.set_offsets(req.video_offset_ms, req.audio_offset_ms)
+    return player.set_offsets(
+        req.video_offset_ms,
+        req.audio_offset_ms,
+        req.video_offset_enabled,
+        req.audio_offset_enabled,
+    )
 
 
 @router.post("/mute", response_model=PlayerState)
@@ -86,3 +92,10 @@ def set_muted(
     req: MuteRequest, player: PlayerService = Depends(get_player)
 ) -> PlayerState:
     return player.set_muted(req.muted)
+
+
+@router.post("/loop", response_model=PlayerState)
+def set_loop_mode(
+    req: LoopRequest, player: PlayerService = Depends(get_player)
+) -> PlayerState:
+    return player.set_loop_mode(req.loop_mode)

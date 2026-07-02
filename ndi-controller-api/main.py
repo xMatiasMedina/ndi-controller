@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -22,7 +22,10 @@ from api import (
     routes_settings,
     routes_ws,
 )
+import dev_config
+from services.cast_service import CastService
 from services.library_service import LibraryService
+from services.screenshare_service import ScreenShareService
 from services.modbus_service import ModbusService
 from services.obs_service import ObsService
 from services.persistence_service import JsonPersistenceService
@@ -44,6 +47,8 @@ class Container:
         self.obs = ObsService(self.settings)
         self.reaper = ReaperService(self.settings)
         self.modbus = ModbusService(self.settings)
+        self.cast = CastService()
+        self.screenshare = ScreenShareService(self.settings)
         self.player = PlayerService(
             library=self.library,
             playlists=self.playlists,
@@ -51,6 +56,9 @@ class Container:
             obs=self.obs,
             reaper=self.reaper,
         )
+        # Live (screen-share) sync offsets are applied in the WebRTC→NDI
+        # receiver, so route them there when the active source is live.
+        self.player.set_live_offset_handler(self.screenshare.set_offset)
 
     async def startup(self) -> None:
         """Async init — connect to external services."""
@@ -69,6 +77,8 @@ class Container:
         self.player.shutdown()
         await self.obs.disconnect()
         await self.modbus.disconnect()
+        await self.cast.stop()
+        self.screenshare.stop()
 
 
 container = Container()
@@ -102,6 +112,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def no_cache_html(request: Request, call_next):
+    """Stop browsers (and the Nest/kiosk) from caching the SPA shell, so a new
+    deploy shows up on reload without a manual hard-refresh. Hashed JS/CSS assets
+    keep their normal long-lived caching."""
+    response = await call_next(request)
+    if "text/html" in response.headers.get("content-type", ""):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 # Wire dependency overrides — routes ask via Depends(get_xxx),
 # we point those at the container's shared instances.
@@ -216,7 +237,91 @@ async def set_default_playlist(body: DefaultPlaylistBody):
     import asyncio
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, container.player.refresh_default)
+    # refresh_default only broadcasts if it (re)starts the default; force a
+    # broadcast so the new selection reaches all clients live, even when manual
+    # playback is active (e.g. changed from Home Assistant mid-playback).
+    container.player.publish_state()
     return {"default_playlist_id": body.playlist_id}
+
+
+# ---- Cast the /remote dashboard to a Google Nest Hub ----
+class CastStartBody(BaseModel):
+    ip: str
+    url: Optional[str] = None
+
+
+@app.post("/api/cast/start")
+async def cast_start(body: CastStartBody, request: Request):
+    cfg = dev_config.get().cast
+    # Precedence: explicit dev_config override > URL the browser sent
+    # (its own origin) > derive from the request host.
+    url = (cfg.url or body.url or "").strip()
+    if not url:
+        url = str(request.base_url).rstrip("/") + cfg.dashboard_path
+    res = await container.cast.start(body.ip.strip(), url)
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=res.get("error", "cast failed"))
+    return res
+
+
+@app.post("/api/cast/stop")
+async def cast_stop():
+    return await container.cast.stop()
+
+
+@app.get("/api/cast/status")
+async def cast_status():
+    return container.cast.status()
+
+
+# ---- WebRTC screen share (WHIP → GStreamer VAAPI decode → NDI) ----
+@app.post("/api/screen-share/whip")
+async def screen_share_whip(request: Request):
+    import asyncio
+    offer = (await request.body()).decode("utf-8")
+    loop = asyncio.get_running_loop()
+    # Free the NDI senders (suspend the player) and switch OBS to StreamScreen.
+    container.player.suspend_for_screenshare()
+    if container.obs.is_connected():
+        try:
+            await container.obs.switch_to_stream_screen()
+        except Exception as e:
+            print(f"[screen-share] OBS switch failed: {e}")
+    res = await loop.run_in_executor(None, container.screenshare.start)
+    if not res.get("ok"):
+        container.player.resume_after_screenshare()
+        raise HTTPException(status_code=502, detail=res.get("error", "receiver failed"))
+    # Push the current sync offsets to the freshly-started receiver so they're
+    # in effect from the first frame (the receiver is respawned per share).
+    st = container.player.get_state()
+    await loop.run_in_executor(
+        None, container.screenshare.set_offset,
+        st.video_offset_ms, st.audio_offset_ms,
+        st.video_offset_enabled, st.audio_offset_enabled,
+    )
+    try:
+        answer = await loop.run_in_executor(
+            None, container.screenshare.forward_whip, offer
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"WHIP signaling failed: {e}")
+    if not answer:
+        raise HTTPException(status_code=502, detail="no WHIP answer")
+    return Response(content=answer, media_type="application/sdp", status_code=201)
+
+
+@app.post("/api/screen-share/stop")
+async def screen_share_stop():
+    import asyncio
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, container.screenshare.stop)
+    if container.obs.is_connected():
+        try:
+            await container.obs.schedule_revert_scene()
+        except Exception as e:
+            print(f"[screen-share] OBS revert failed: {e}")
+    container.player.resume_after_screenshare()
+    return {"ok": True}
 
 
 @app.get("/api/health")

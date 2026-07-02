@@ -22,17 +22,27 @@ _DEV_CONFIG_FILE = paths.DATA_DIR / "dev_config.json"
 
 
 class ScreenShareObs(BaseModel):
-    """OBS scene/source that the app auto-provisions for screen sharing."""
-    scene_name: str = "StreamScreen"
-    source_name: str = "StreamScreen"
-    ndi_source_name: str = "AV_Platform_NDI"  # NDI source name to receive from
+    """OBS scene the app switches to for screen sharing. If the scene already
+    exists it is used as-is; only a missing scene is auto-provisioned."""
+    scene_name: str = "ShareScreen"
+    source_name: str = "ShareScreen"
+    ndi_source_name: str = "OBS Video"  # NDI source name to receive from
     ndi_input_kind: str = "ndi_source"  # OBS input kind for NDI plugin
     switch_delay_sec: float = 2.0       # delay before reverting scene after share ends
+
+
+class CastSettings(BaseModel):
+    """Casting the /remote dashboard to a Google Nest Hub (DashCast)."""
+    url: str = ""                  # URL the Nest loads; empty = derive from request host
+    dashboard_path: str = "/remote"
+    check_interval_sec: int = 30   # state-aware keep-alive poll interval (seconds)
+    last_ip: str = ""              # remembered last cast target
 
 
 class DevConfig(BaseModel):
     """Top-level dev/deployment config."""
     screen_share_obs: ScreenShareObs = Field(default_factory=ScreenShareObs)
+    cast: CastSettings = Field(default_factory=CastSettings)
 
 
 # ---- Singleton load/save ----

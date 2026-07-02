@@ -621,134 +621,355 @@ input[type="range"]::-webkit-slider-thumb {
   background: var(--bg-tertiary);
 }
 
-/* ================= Simple Remote page (/remote) ================= */
+/* ================= Simple Remote page (/remote) =================
+   Primary target: Google Nest Hub — 1024x600 landscape, touch, viewed from a
+   distance. Two columns fit the viewport with no page scroll; only the cast
+   list scrolls. Falls back to a stacked, scrollable layout on phones. */
 .remote-page {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 20px 16px 48px;
-  min-height: 100vh;
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 14px;
+  padding: 14px 16px;
+  min-height: 100vh;
+  box-sizing: border-box;
 }
 .remote-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
+  gap: 12px;
+  flex-shrink: 0;
 }
-.remote-title { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+.remote-title { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
 .remote-title .accent { color: var(--accent-primary); }
+/* LoreaTec icon mark — bright on transparent, sits directly on the dark UI. */
+.remote-logo {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.remote-logo img { height: 44px; width: auto; display: block; }
+/* Blue neon rules flanking the centered logo */
+.remote-rule {
+  flex: 1;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--accent-primary);
+  box-shadow: 0 0 6px rgba(79, 142, 255, 0.85), 0 0 14px rgba(79, 142, 255, 0.5);
+}
+
+/* Hidden keep-alive video — anti-idle for when /remote is cast to a Nest Hub */
+.cast-keepalive {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.remote-header-right { display: flex; align-items: center; gap: 10px; }
 .remote-advanced {
   color: var(--text-secondary);
   text-decoration: none;
-  font-size: 13px;
+  font-size: 14px;
   padding: 8px 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+  white-space: nowrap;
 }
-.remote-advanced:hover { color: var(--text-primary); border-color: var(--border-strong); }
+.remote-advanced:active { color: var(--text-primary); border-color: var(--border-strong); }
 
-.remote-section {
+/* Stacked by default (phones); two columns on wider screens (rule below). */
+.remote-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.remote-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 16px;
+  padding: 14px;
+  min-height: 0;
 }
-.remote-section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+.remote-col-label {
   font-size: 12px;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
+  font-weight: 700;
   color: var(--text-secondary);
-  margin-bottom: 12px;
+  flex-shrink: 0;
 }
 
-.remote-btn {
-  border: 1px solid var(--border-strong);
-  background: var(--bg-elevated);
-  color: var(--text-primary);
-  border-radius: var(--radius-sm);
-  padding: 12px 16px;
-  font-size: 15px;
-  font-weight: 600;
+/* Master on/off — bold filled action buttons that pop off the dark UI */
+.screen-master { display: flex; gap: 10px; flex-shrink: 0; }
+.mbtn {
+  flex: 1;
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  font-size: 18px;
+  font-weight: 700;
   cursor: pointer;
-  transition: filter 0.15s, transform 0.05s, background 0.15s;
+  transition: background 0.15s;
+  -webkit-tap-highlight-color: transparent;
 }
-.remote-btn:active { transform: scale(0.97); }
-.remote-btn:disabled { opacity: 0.5; cursor: default; }
-.remote-btn.big { flex: 1; padding: 18px; font-size: 17px; }
-.remote-btn.on { border-color: rgba(74, 222, 128, 0.5); color: var(--success); }
-.remote-btn.on:hover { background: rgba(74, 222, 128, 0.12); }
-.remote-btn.off { border-color: rgba(248, 113, 113, 0.5); color: var(--danger); }
-.remote-btn.off:hover { background: rgba(248, 113, 113, 0.12); }
-.remote-btn.stop { border-color: rgba(248, 113, 113, 0.5); color: var(--danger); flex-shrink: 0; }
+.mbtn:disabled { opacity: 0.5; cursor: default; }
+.mbtn-on {
+  background: rgba(74, 222, 128, 0.12);
+  border-color: rgba(74, 222, 128, 0.4);
+  color: var(--success);
+}
+.mbtn-on:hover:not(:disabled) { background: rgba(74, 222, 128, 0.18); }
+.mbtn-off {
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.38);
+  color: var(--danger);
+}
+.mbtn-off:hover:not(:disabled) { background: rgba(248, 113, 113, 0.16); }
 
-.screen-master { display: flex; gap: 10px; margin-bottom: 12px; }
-.screen-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.screen-ctl {
+/* Screen zones — a status card with a segmented On/Off toggle */
+.screen-zones { display: flex; flex-direction: column; gap: 12px; }
+.zone {
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   padding: 12px;
   background: var(--bg-tertiary);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.screen-ctl.is-on {
-  border-color: rgba(74, 222, 128, 0.45);
-  box-shadow: inset 0 0 0 1px rgba(74, 222, 128, 0.15);
+.zone.is-on {
+  border-color: rgba(74, 222, 128, 0.4);
 }
-.screen-name {
+.zone-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-weight: 600;
-  font-size: 14px;
   margin-bottom: 10px;
 }
-.screen-state { font-size: 11px; color: var(--text-muted); }
-.screen-ctl.is-on .screen-state { color: var(--success); }
-.screen-buttons { display: flex; gap: 8px; }
-.screen-buttons .remote-btn { flex: 1; padding: 10px; }
+.zone-name { font-weight: 700; font-size: 16px; }
+.zone-state {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+.zone.is-on .zone-state { background: rgba(74, 222, 128, 0.16); color: var(--success); }
+.zone-toggle {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.seg {
+  flex: 1;
+  min-height: 44px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 15px;
+  font-weight: 700;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.seg:disabled { opacity: 0.6; cursor: default; }
+.seg:not(.active):hover:not(:disabled) { background: var(--bg-elevated); color: var(--text-primary); }
+.seg.active.seg-on {
+  background: rgba(74, 222, 128, 0.16);
+  color: var(--success);
+}
+.seg.active.seg-off {
+  background: rgba(248, 113, 113, 0.14);
+  color: var(--danger);
+}
 
 .now-casting {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-shrink: 0;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.now-casting-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.now-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--accent-primary);
 }
 .now-name {
-  font-size: 16px;
-  font-weight: 600;
+  font-size: 18px;
+  font-weight: 700;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.stop-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-height: 48px;
+  padding: 0 18px;
+  border-radius: var(--radius);
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  transition: transform 0.06s, filter 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.stop-btn:active { transform: scale(0.97); }
+.stop-btn:disabled { opacity: 0.5; cursor: default; }
+.stop-btn.armed {
+  background: rgba(248, 113, 113, 0.14);
+  color: var(--danger);
+  border-color: rgba(248, 113, 113, 0.4);
+}
 
+.cast-scroll { display: flex; flex-direction: column; gap: 6px; }
+.cast-group-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--text-secondary);
+  margin-top: 8px;
+}
 .cast-list { display: flex; flex-direction: column; gap: 8px; }
 .cast-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 12px;
   width: 100%;
   border: 1px solid var(--border);
   background: var(--bg-tertiary);
   color: var(--text-primary);
-  border-radius: var(--radius-sm);
-  padding: 14px 16px;
-  font-size: 15px;
+  border-radius: var(--radius);
+  padding: 11px 14px;
+  font-size: 16px;
+  min-height: 56px;
   cursor: pointer;
   text-align: left;
-  transition: background 0.15s, border-color 0.15s;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.15s, border-color 0.15s, transform 0.06s;
 }
-.cast-item:hover { background: var(--bg-elevated); border-color: var(--border-strong); }
+.cast-item:hover { border-color: var(--border-strong); background: var(--bg-elevated); }
+.cast-item:active { transform: scale(0.99); }
+.cast-play {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elevated);
+  color: var(--accent-primary);
+  font-size: 12px;
+  padding-left: 2px;
+}
 .cast-item.active {
   border-color: var(--accent-primary);
-  box-shadow: inset 0 0 0 1px var(--accent-glow);
+  background: rgba(79, 142, 255, 0.1);
 }
-.cast-item-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cast-item-meta { color: var(--text-secondary); font-size: 13px; margin-left: 12px; flex-shrink: 0; }
+.cast-item.active .cast-play { background: var(--accent-primary); color: #04122e; }
+.cast-item-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cast-item-meta {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+.cast-item.active .cast-item-meta { background: rgba(79, 142, 255, 0.22); color: var(--text-primary); }
 
-@media (max-width: 480px) {
-  .screen-grid { grid-template-columns: 1fr; }
+/* Playlist row = tappable cast button + a star to set it as the default loop */
+.cast-row { display: flex; gap: 8px; align-items: stretch; }
+.cast-row .cast-item-main { flex: 1; min-width: 0; }
+.cast-star {
+  flex-shrink: 0;
+  width: 54px;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  border-radius: var(--radius);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.15s, color 0.15s;
+}
+.cast-star:hover { color: var(--warning); }
+.cast-star:active { background: var(--bg-elevated); }
+.cast-star.is-default {
+  color: var(--warning);
+  border-color: rgba(251, 191, 36, 0.55);
+  background: rgba(251, 191, 36, 0.1);
+}
+
+/* ---- Wide screens (>=700px): two columns ----
+   Centered panel with natural heights — good for desktop monitors and tablets.
+   The page scrolls normally if the cast list is long. */
+@media (min-width: 700px) {
+  .remote-page {
+    max-width: 1200px;
+    width: 100%;
+    margin: 0 auto;
+  }
+  .remote-grid {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 16px;
+  }
+  .remote-col-screens { flex: 0 0 340px; }
+  .remote-col-cast { flex: 1; min-width: 0; }
+}
+
+/* ---- Short landscape: Google Nest Hub (1024x600), short laptop windows ----
+   Fit the viewport exactly — no page scroll; only the cast list scrolls. */
+@media (min-width: 700px) and (max-height: 800px) {
+  .remote-page {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .remote-grid {
+    flex: 1;
+    min-height: 0;
+    align-items: stretch;
+  }
+  .remote-col-cast .cast-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
 }

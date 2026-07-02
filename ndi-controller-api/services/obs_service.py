@@ -205,43 +205,32 @@ class ObsService(IObsClient):
         loop = asyncio.get_running_loop()
 
         try:
-            # Check if scene exists
             scenes = await self.list_scenes()
-            if cfg.scene_name not in scenes:
-                await loop.run_in_executor(
-                    None, self._client.create_scene, cfg.scene_name
-                )
-                print(f"[obs] created scene '{cfg.scene_name}'")
+            if cfg.scene_name in scenes:
+                # Scene already exists (user-configured) — use it as-is,
+                # don't touch its sources.
+                return
 
-            # Check if the NDI source already exists in the scene
-            items = await self.list_scene_items(cfg.scene_name)
-            source_exists = any(
-                item["sourceName"] == cfg.source_name for item in items
+            # Only auto-provision a fresh scene + NDI source when nothing exists.
+            await loop.run_in_executor(
+                None, self._client.create_scene, cfg.scene_name
             )
-
-            if not source_exists:
-                # Create the NDI input and add it to the scene
-                await loop.run_in_executor(
-                    None,
-                    self._client.create_input,
-                    cfg.scene_name,        # sceneName
-                    cfg.source_name,       # inputName
-                    cfg.ndi_input_kind,    # inputKind (e.g. "ndi_source")
-                    {"ndi_source_name": cfg.ndi_source_name},  # inputSettings
-                    True,                  # sceneItemEnabled
-                )
-                print(
-                    f"[obs] created NDI source '{cfg.source_name}' "
-                    f"(receiving from '{cfg.ndi_source_name}') "
-                    f"in scene '{cfg.scene_name}'"
-                )
-
-            print(f"[obs] StreamScreen provisioned: scene='{cfg.scene_name}', source='{cfg.source_name}'")
-
+            await loop.run_in_executor(
+                None,
+                self._client.create_input,
+                cfg.scene_name,        # sceneName
+                cfg.source_name,       # inputName
+                cfg.ndi_input_kind,    # inputKind (e.g. "ndi_source")
+                {"ndi_source_name": cfg.ndi_source_name},  # inputSettings
+                True,                  # sceneItemEnabled
+            )
+            print(
+                f"[obs] provisioned scene '{cfg.scene_name}' with NDI source "
+                f"'{cfg.source_name}' (from '{cfg.ndi_source_name}')"
+            )
         except Exception as e:
-            # Non-fatal — screen share will still work, just without
-            # automatic scene switching
-            print(f"[obs] WARNING: failed to provision StreamScreen: {e}")
+            # Non-fatal — screen share still works, just without auto-provision.
+            print(f"[obs] WARNING: failed to provision {cfg.scene_name}: {e}")
 
     async def switch_to_stream_screen(self) -> None:
         """Switch OBS to the StreamScreen scene, remembering the previous one."""
@@ -258,7 +247,12 @@ class ObsService(IObsClient):
             self._previous_scene = current
 
         await self.set_current_scene(cfg.scene_name)
-        print(f"[obs] switched to StreamScreen (previous: {self._previous_scene})")
+        # The ShareScreen scene's layout — one NDI copy fit into each physical
+        # screen's region (e.g. Warehouse / Office), matching the LED-wall
+        # mapping — is configured in OBS by the operator. We deliberately do NOT
+        # reposition or resize its sources here; doing so would clobber that
+        # per-screen calibration and split the image across the screens.
+        print(f"[obs] switched to {cfg.scene_name} (previous: {self._previous_scene})")
 
     async def schedule_revert_scene(self) -> None:
         """After screen share ends, wait then revert to the previous scene.

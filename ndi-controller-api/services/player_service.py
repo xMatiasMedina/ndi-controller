@@ -62,11 +62,67 @@ class PlayerService:
         self._generation = 0
         # True while the auto-started default playlist is the active content.
         self._is_default_active = False
+        # True while an external source (WebRTC screen-share via GStreamer)
+        # owns the NDI senders — blocks default-playlist resume.
+        self._screenshare_active = False
+        # Applies offsets to the live (screen-share) WebRTC→NDI pipeline.
+        # Signature: (video_ms, audio_ms, video_enabled, audio_enabled).
+        self._live_offset_handler = None
+
+    def set_live_offset_handler(self, handler) -> None:
+        """Wire the live (screen-share) offset applier — see ScreenShareService."""
+        self._live_offset_handler = handler
 
     # ---------------------------------------------------------------- public
     def get_state(self) -> PlayerState:
+        default_id = self._settings.get().default_playlist_id
         with self._state_lock:
-            return self._state.model_copy(deep=True)
+            st = self._state.model_copy(deep=True)
+        # default_playlist_id lives in settings; surface it on every state read
+        # so each WS broadcast carries the current value — keeping the UI in
+        # sync even when it's changed externally (e.g. via Home Assistant).
+        st.default_playlist_id = default_id
+        # Whether the default playlist is the ACTIVE content (drives the UI's
+        # "yellow" loop state). Computed from the consistent snapshot — not
+        # re-read from live state — and only while actually playing (stop()
+        # leaves mode/current_playlist_id set, so the status check matters).
+        st.is_default = (
+            default_id is not None
+            and st.status != PlaybackStatus.STOPPED
+            and st.mode == PlaybackMode.PLAYLIST
+            and st.current_playlist_id == default_id
+        )
+        return st
+
+    def _is_default_content(self) -> bool:
+        """True when the ACTIVE content is the configured default playlist —
+        however it started (auto-resume OR the user manually selecting it). So
+        manually playing the default playlist loops and shows the yellow state
+        just like the resting state does. Reads live state without locking —
+        call under _state_lock or where a slightly stale read is harmless."""
+        default_id = self._settings.get().default_playlist_id
+        return (
+            default_id is not None
+            and self._state.status != PlaybackStatus.STOPPED
+            and self._state.mode == PlaybackMode.PLAYLIST
+            and self._state.current_playlist_id == default_id
+        )
+
+    def _effective_loop_mode(self) -> str:
+        """The loop behaviour for the current item: the user's persistent choice
+        if any, otherwise the default playlist still loops ('all', shown yellow)
+        as the resting state while user-selected media plays once. Reads state
+        without locking — call while holding _state_lock or where a slightly
+        stale read is harmless."""
+        if self._state.loop_mode != "off":
+            return self._state.loop_mode
+        return "all" if self._is_default_content() else "off"
+
+    def publish_state(self) -> None:
+        """Force a state broadcast to WS clients. Use after something that
+        affects state but isn't routed through a player method — e.g. the
+        default playlist being changed in settings (UI or Home Assistant)."""
+        self._publish_state_change()
 
     def play(
         self,
@@ -74,17 +130,22 @@ class PlayerService:
         video_id: Optional[str] = None,
         playlist_id: Optional[str] = None,
         monitor_index: Optional[int] = None,
-        loop: bool = False,
+        loop_mode: Optional[str] = None,
     ) -> PlayerState:
         """Start playback. Stops any current playback first."""
         with self._lifecycle_lock:
             # A manual play takes over from the default resting state.
             self._is_default_active = False
+            self._screenshare_active = False
             self._stop_streamer()
 
             with self._state_lock:
                 self._state.mode = mode
-                self._state.loop = loop
+                # 'all'/'one' persist across plays; omit (None) to keep the
+                # current preference. The default playlist's resting-state
+                # looping is handled by _effective_loop_mode, not stored here.
+                if loop_mode is not None:
+                    self._state.loop_mode = loop_mode
 
                 if mode == PlaybackMode.SINGLE:
                     if not video_id:
@@ -194,20 +255,39 @@ class PlayerService:
         self,
         video_offset_ms: Optional[int] = None,
         audio_offset_ms: Optional[int] = None,
+        video_offset_enabled: Optional[bool] = None,
+        audio_offset_enabled: Optional[bool] = None,
     ) -> PlayerState:
         with self._state_lock:
-            if self._state.is_live:
-                return self._state.model_copy(deep=True)
             if video_offset_ms is not None:
                 self._state.video_offset_ms = video_offset_ms
             if audio_offset_ms is not None:
                 self._state.audio_offset_ms = audio_offset_ms
+            if video_offset_enabled is not None:
+                self._state.video_offset_enabled = video_offset_enabled
+            if audio_offset_enabled is not None:
+                self._state.audio_offset_enabled = audio_offset_enabled
+            is_live = self._state.is_live
+            v = self._state.video_offset_ms
+            a = self._state.audio_offset_ms
+            v_en = self._state.video_offset_enabled
+            a_en = self._state.audio_offset_enabled
             streamer = self._streamer
-        if streamer:
-            if video_offset_ms is not None:
-                streamer.set_video_offset_ms(video_offset_ms)
-            if audio_offset_ms is not None:
-                streamer.set_audio_offset_ms(audio_offset_ms)
+
+        if is_live:
+            # Live (screen/browser): apply via the WebRTC→NDI receiver, which
+            # delays each branch. The file streamer isn't running here.
+            if self._live_offset_handler is not None:
+                try:
+                    self._live_offset_handler(v, a, v_en, a_en)
+                except Exception as e:
+                    print(f"[player] live offset handler failed: {e}")
+        elif streamer:
+            # File source: shift the frame scheduler. Bypassed (0) when the
+            # stream's checkbox is unticked, so the UI behaves the same as live.
+            streamer.set_video_offset_ms(v if v_en else 0)
+            streamer.set_audio_offset_ms(a if a_en else 0)
+
         self._publish_state_change()
         return self.get_state()
 
@@ -217,6 +297,17 @@ class PlayerService:
             streamer = self._streamer
         if streamer:
             streamer.set_muted(muted)
+        self._publish_state_change()
+        return self.get_state()
+
+    def set_loop_mode(self, loop_mode: str) -> PlayerState:
+        """Set the loop preference live: 'off' | 'all' | 'one'. 'all'/'one' are
+        persistent user choices that carry across media; 'off' clears the user
+        loop (the default playlist still loops as the resting state, shown
+        yellow). Read live by _on_finished so it affects the current item too."""
+        mode = loop_mode if loop_mode in ("off", "all", "one") else "off"
+        with self._state_lock:
+            self._state.loop_mode = mode
         self._publish_state_change()
         return self.get_state()
 
@@ -257,10 +348,40 @@ class PlayerService:
             if status == PlaybackStatus.STOPPED or self._is_default_active:
                 self._maybe_start_default_locked()
 
+    def suspend_for_screenshare(self) -> None:
+        """Hand the NDI senders to an external WebRTC screen-share: stop the
+        Python streamer and block default-playlist resume until it ends."""
+        with self._lifecycle_lock:
+            self._screenshare_active = True
+            self._is_default_active = False
+            self._stop_streamer()
+            with self._state_lock:
+                self._state.mode = PlaybackMode.BROWSER
+                self._state.status = PlaybackStatus.PLAYING
+                self._state.is_live = True
+                self._state.current_video_id = None
+                self._state.current_playlist_id = None
+                self._state.position_seconds = 0.0
+            if self._settings.get().reaper.lockstep:
+                self._reaper.stop()
+            self._publish_state_change()
+
+    def resume_after_screenshare(self) -> None:
+        """Screen-share ended — return to the default resting state."""
+        with self._lifecycle_lock:
+            self._screenshare_active = False
+            with self._state_lock:
+                self._state.status = PlaybackStatus.STOPPED
+                self._state.is_live = False
+            self._publish_state_change()
+            self._maybe_start_default_locked()
+
     def _maybe_start_default_locked(self) -> None:
         """Start the configured default playlist, looping, as the resting state.
         No-op if no default is set or it is empty/missing.
         Caller must hold _lifecycle_lock."""
+        if self._screenshare_active:
+            return  # an external screen-share owns the NDI senders
         default_id = self._settings.get().default_playlist_id
         if not default_id:
             return
@@ -271,7 +392,12 @@ class PlayerService:
         self._stop_streamer()
         with self._state_lock:
             self._state.mode = PlaybackMode.PLAYLIST
-            self._state.loop = True
+            # Entering the resting default clears any persistent user loop, so
+            # it shows the YELLOW "looping because default" state and rotates
+            # through ALL its items (loop_mode 'off' + is_default → effective
+            # 'all'). A leftover 'one' would otherwise pin the default to its
+            # first item forever; a leftover 'all' would just mis-show as blue.
+            self._state.loop_mode = "off"
             self._state.current_playlist_id = default_id
             self._state.playlist_cursor = 0
             self._state.current_video_id = playlist.video_ids[0]
@@ -371,7 +497,9 @@ class PlayerService:
 
                 if 0 <= new_cursor < n:
                     self._state.playlist_cursor = new_cursor
-                elif self._state.loop:
+                elif self._effective_loop_mode() != "off":
+                    # Wrap when looping at all (user 'all'/'one', or the default
+                    # playlist). 'one' only reaches here via a manual next/prev.
                     self._state.playlist_cursor = new_cursor % n
                 else:
                     self._state.status = PlaybackStatus.STOPPED
@@ -421,15 +549,21 @@ class PlayerService:
 
         with self._state_lock:
             mode = self._state.mode
-            loop = self._state.loop
             status = self._state.status
 
         if status == PlaybackStatus.STOPPED:
             return
 
-        if mode == PlaybackMode.PLAYLIST:
+        eff = self._effective_loop_mode()  # 'off' | 'all' | 'one'
+        if eff == "one":
+            # Loop the current item only — replay it without advancing, even
+            # inside a playlist.
+            self._schedule_async(self._restart_single_async())
+        elif mode == PlaybackMode.PLAYLIST:
+            # Advance; _advance_playlist wraps when looping ('all'/default) or
+            # stops at the end when 'off'.
             self._schedule_async(self._advance_playlist_async(+1))
-        elif mode == PlaybackMode.SINGLE and loop:
+        elif eff == "all":
             self._schedule_async(self._restart_single_async())
         else:
             self._schedule_async(self._stop_async())

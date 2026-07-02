@@ -15,11 +15,24 @@ export default function App() {
   const [loop, setLoop] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [activeTab, setActiveTab] = useState('offsets'); // 'offsets' | 'obs'
+  const [screensConnected, setScreensConnected] = useState(false);
 
   // Keep a local list of videos for "now playing" name lookup.
   // Poll only when WebSocket is disconnected; otherwise a single fetch suffices.
   useEffect(() => {
     api.listVideos().then(setVideos).catch(() => {});
+  }, []);
+
+  // Poll the Modbus relay status for the Screens pill.
+  useEffect(() => {
+    const load = () =>
+      api
+        .getScreens()
+        .then((s) => setScreensConnected(!!s.connected))
+        .catch(() => setScreensConnected(false));
+    load();
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
   }, []);
 
   useEffect(() => {
@@ -83,13 +96,9 @@ export default function App() {
             <span className={`pill ${reaperConfigured ? 'live' : 'off'}`}>
             <span className="dot" /> Reaper {reaperConfigured ? 'ready' : 'off'}
           </span>
-            <a
-                href="/remote"
-                className="header-link"
-                title="Open the simple cast remote"
-            >
-              Remote
-            </a>
+            <span className={`pill ${screensConnected ? 'live' : 'off'}`}>
+            <span className="dot" /> Screens {screensConnected ? 'online' : 'off'}
+          </span>
             <button
                 onClick={() => setShowSettings(true)}
                 className="settings-btn"

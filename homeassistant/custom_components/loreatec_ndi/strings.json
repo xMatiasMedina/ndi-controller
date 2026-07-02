@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "LoreaTec NDI Controller",
+        "description": "Enter the IP address and port of the NDI Controller API. The scheme (HTTPS/HTTP) is detected automatically.",
+        "data": {
+          "host": "IP address",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the NDI Controller at that address. Check the IP and port."
+    },
+    "abort": {
+      "already_configured": "This NDI Controller is already configured."
+    }
+  }
+}
