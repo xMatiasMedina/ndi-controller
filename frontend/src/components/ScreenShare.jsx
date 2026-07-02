@@ -15,6 +15,26 @@ const isSecureContext =
     location.hostname === 'localhost' ||
     location.hostname === '127.0.0.1';
 
+// Force high-quality stereo Opus in an SDP. Default WebRTC Opus is mono and
+// low-bitrate (~mediumband, ~6 kHz ceiling); rewriting the opus fmtp to stereo
+// + a high maxaveragebitrate makes Chrome encode full-band stereo. The station
+// WHIP receiver echoes the same params in its answer so both sides agree.
+function boostOpus(sdp) {
+    if (!sdp) return sdp;
+    const m = sdp.match(/a=rtpmap:(\d+)\s+opus\/48000/i);
+    if (!m) return sdp;
+    const pt = m[1];
+    const params =
+        'minptime=10;useinbandfec=1;usedtx=0;stereo=1;sprop-stereo=1;' +
+        'maxaveragebitrate=256000;maxplaybackrate=48000';
+    const fmtp = new RegExp('a=fmtp:' + pt + ' [^\\r\\n]*');
+    if (fmtp.test(sdp)) return sdp.replace(fmtp, 'a=fmtp:' + pt + ' ' + params);
+    return sdp.replace(
+        new RegExp('(a=rtpmap:' + pt + ' opus/48000[^\\r\\n]*)'),
+        '$1\r\na=fmtp:' + pt + ' ' + params
+    );
+}
+
 export default function ScreenShare() {
     const [sharing, setSharing] = useState(false);
     const [error, setError] = useState(null);
@@ -51,12 +71,21 @@ export default function ScreenShare() {
         try {
             const stream = await navigator.mediaDevices.getDisplayMedia({
                 video: { frameRate: { ideal: 30 } },
-                audio: true,
+                audio: {
+                    // Music, not voice: disable Chrome's voice DSP (AGC pumps
+                    // the level; NS/EC eat the highs) and ask for stereo.
+                    autoGainControl: false,
+                    noiseSuppression: false,
+                    echoCancellation: false,
+                    channelCount: 2,
+                },
             });
             streamRef.current = stream;
 
             const videoTrack = stream.getVideoTracks()[0];
-            videoTrack.contentHint = 'detail';
+            // Smooth motion: prioritise frame rate over per-frame detail so
+            // moving content doesn't stutter (drops resolution, not frames).
+            videoTrack.contentHint = 'motion';
             videoTrack.onended = () => stopSharing();
 
             const pc = new RTCPeerConnection();
@@ -69,10 +98,31 @@ export default function ScreenShare() {
                 const h264 = caps.codecs.filter((c) => c.mimeType === 'video/H264');
                 if (h264.length && vtx.setCodecPreferences) vtx.setCodecPreferences(h264);
             } catch {}
+            // Under CPU/bandwidth pressure, drop resolution rather than frame
+            // rate — keeps the video smooth (no stutter) on the wall.
+            try {
+                const p = vtx.sender.getParameters();
+                if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+                p.degradationPreference = 'maintain-framerate';
+                await vtx.sender.setParameters(p);
+            } catch (e) {
+                console.warn('[screen-share] video setParameters failed:', e);
+            }
 
             const audioTrack = stream.getAudioTracks()[0];
             if (audioTrack) {
-                pc.addTransceiver(audioTrack, { direction: 'sendonly' });
+                const atx = pc.addTransceiver(audioTrack, { direction: 'sendonly' });
+                // Lift the encoder's bitrate cap (default throttles to ~mono
+                // mediumband). Stereo + full-band comes from the Opus fmtp in
+                // the offer (boostOpus) and the receiver's matching answer.
+                try {
+                    const p = atx.sender.getParameters();
+                    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+                    p.encodings[0].maxBitrate = 320_000;
+                    await atx.sender.setParameters(p);
+                } catch (e) {
+                    console.warn('[screen-share] audio setParameters failed:', e);
+                }
                 setHasAudio(true);
             }
 
@@ -83,7 +133,9 @@ export default function ScreenShare() {
                 }
             };
 
-            await pc.setLocalDescription(await pc.createOffer());
+            const offer = await pc.createOffer();
+            offer.sdp = boostOpus(offer.sdp);
+            await pc.setLocalDescription(offer);
             // Non-trickle WHIP: wait for ICE gathering, then send the full offer.
             await new Promise((resolve) => {
                 if (pc.iceGatheringState === 'complete') return resolve();

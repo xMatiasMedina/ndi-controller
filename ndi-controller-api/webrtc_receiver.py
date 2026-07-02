@@ -20,6 +20,7 @@ latency). Offsets can be set at startup (args) or live (POST /offset).
 """
 import argparse
 import json
+import re
 import sys
 import threading
 
@@ -49,6 +50,24 @@ CURRENT = None
 
 def log(*a):
     print("[webrtc-recv]", *a, flush=True)
+
+
+def boost_opus(sdp: str) -> str:
+    """Rewrite the Opus fmtp so the browser encodes full-band STEREO at a high
+    bitrate instead of the default mono ~mediumband (~6 kHz ceiling). Applied to
+    the answer we hand back; opusdec on the receive side decodes whatever the
+    browser actually sends."""
+    m = re.search(r'a=rtpmap:(\d+)\s+opus/48000', sdp, re.IGNORECASE)
+    if not m:
+        return sdp
+    pt = m.group(1)
+    params = ("minptime=10;useinbandfec=1;usedtx=0;stereo=1;sprop-stereo=1;"
+              "maxaveragebitrate=256000;maxplaybackrate=48000")
+    fmtp = "a=fmtp:%s %s" % (pt, params)
+    if re.search(r'a=fmtp:%s [^\r\n]*' % pt, sdp):
+        return re.sub(r'a=fmtp:%s [^\r\n]*' % pt, fmtp, sdp)
+    return re.sub(r'(a=rtpmap:%s opus/48000[^\r\n]*)' % pt,
+                  lambda mo: mo.group(1) + "\r\n" + fmtp, sdp)
 
 
 def _delay_ns(ms, on):
@@ -153,8 +172,8 @@ class Session:
         ):
             local = webrtc.get_property("local-description")
             if local is not None:
-                self.answer_sdp = local.sdp.as_text()
-                log("ICE complete; answer ready")
+                self.answer_sdp = boost_opus(local.sdp.as_text())
+                log("ICE complete; answer ready (opus: stereo/high-bitrate)")
             else:
                 log("ERROR: ICE complete but no local description")
             self.done.set()

@@ -144,6 +144,8 @@ export default function App() {
                 <OffsetSliders
                     videoOffsetMs={state?.video_offset_ms ?? 0}
                     audioOffsetMs={state?.audio_offset_ms ?? 0}
+                    videoOffsetEnabled={state?.video_offset_enabled ?? true}
+                    audioOffsetEnabled={state?.audio_offset_enabled ?? true}
                     isLive={state?.is_live ?? false}
                 />
             )}

@@ -68,10 +68,15 @@ export const api = {
         }),
     next: () => request('/api/player/next', { method: 'POST' }),
     previous: () => request('/api/player/previous', { method: 'POST' }),
-    setOffsets: (video_offset_ms, audio_offset_ms) =>
+    setOffsets: (video_offset_ms, audio_offset_ms, video_offset_enabled, audio_offset_enabled) =>
         request('/api/player/offsets', {
             method: 'POST',
-            body: JSON.stringify({ video_offset_ms, audio_offset_ms }),
+            body: JSON.stringify({
+                video_offset_ms,
+                audio_offset_ms,
+                video_offset_enabled,
+                audio_offset_enabled,
+            }),
         }),
     setMuted: (muted) =>
         request('/api/player/mute', {
